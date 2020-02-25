@@ -23,7 +23,6 @@ import java.lang.reflect.InvocationTargetException;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
-import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.TimeoutException;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
@@ -41,7 +40,7 @@ import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;
 import org.apache.hbase.thirdparty.com.google.protobuf.CodedOutputStream;
 import org.apache.hbase.thirdparty.com.google.protobuf.Message;
-
+import org.apache.hbase.thirdparty.io.netty.buffer.ByteBuf;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.CellBlockMeta;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.ExceptionResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.RequestHeader;
@@ -62,19 +61,19 @@ class IPCUtil {
    * @throws IOException if write action fails
    */
   public static int write(final OutputStream dos, final Message header, final Message param,
-      final ByteBuffer cellBlock) throws IOException {
+      final ByteBuf cellBlock) throws IOException {
     // Must calculate total size and write that first so other side can read it all in in one
     // swoop. This is dictated by how the server is currently written. Server needs to change
     // if we are to be able to write without the length prefixing.
     int totalSize = IPCUtil.getTotalSizeWhenWrittenDelimited(header, param);
     if (cellBlock != null) {
-      totalSize += cellBlock.remaining();
+      totalSize += cellBlock.readableBytes();
     }
     return write(dos, header, param, cellBlock, totalSize);
   }
 
   private static int write(final OutputStream dos, final Message header, final Message param,
-      final ByteBuffer cellBlock, final int totalSize) throws IOException {
+      final ByteBuf cellBlock, final int totalSize) throws IOException {
     // I confirmed toBytes does same as DataOutputStream#writeInt.
     dos.write(Bytes.toBytes(totalSize));
     // This allocates a buffer that is the size of the message internally.
@@ -83,7 +82,7 @@ class IPCUtil {
       param.writeDelimitedTo(dos);
     }
     if (cellBlock != null) {
-      dos.write(cellBlock.array(), 0, cellBlock.remaining());
+      cellBlock.readBytes(dos, cellBlock.readableBytes());
     }
     dos.flush();
     return totalSize;
@@ -181,8 +180,8 @@ class IPCUtil {
       return (IOException) new SocketTimeoutException(
         "Call to " + addr + " failed because " + error).initCause(error);
     } else if (error instanceof ConnectionClosingException) {
-      return (IOException) new ConnectionClosingException(
-        "Call to " + addr + " failed on local exception: " + error).initCause(error);
+      return new ConnectionClosingException("Call to " + addr + " failed on local exception: "
+        + error, error);
     } else if (error instanceof ServerTooBusyException) {
       // we already have address in the exception message
       return (IOException) error;
@@ -196,22 +195,22 @@ class IPCUtil {
           | InvocationTargetException | NoSuchMethodException | SecurityException e) {
         // just ignore, will just new a DoNotRetryIOException instead below
       }
-      return (IOException) new DoNotRetryIOException(
-        "Call to " + addr + " failed on local exception: " + error).initCause(error);
+      return new DoNotRetryIOException("Call to " + addr + " failed on local exception: "
+        + error, error);
     } else if (error instanceof ConnectionClosedException) {
-      return (IOException) new ConnectionClosedException(
-        "Call to " + addr + " failed on local exception: " + error).initCause(error);
+      return new ConnectionClosedException("Call to " + addr + " failed on local exception: "
+        + error, error);
     } else if (error instanceof CallTimeoutException) {
-      return (IOException) new CallTimeoutException(
-        "Call to " + addr + " failed on local exception: " + error).initCause(error);
+      return new CallTimeoutException("Call to " + addr + " failed on local exception: "
+        + error, error);
     } else if (error instanceof ClosedChannelException) {
       // ClosedChannelException does not have a constructor which takes a String but it is a
       // connection exception so we keep its original type
       return (IOException) error;
     } else if (error instanceof TimeoutException) {
       // TimeoutException is not an IOException, let's convert it to TimeoutIOException.
-      return (IOException) new TimeoutIOException(
-        "Call to " + addr + " failed on local exception: " + error).initCause(error);
+      return new TimeoutIOException("Call to " + addr + " failed on local exception: "
+        + error, error);
     } else {
       // try our best to keep the original exception type
       if (error instanceof IOException) {
@@ -225,13 +224,13 @@ class IPCUtil {
           // just ignore, will just new an IOException instead below
         }
       }
-      return (IOException) new HBaseIOException(
-        "Call to " + addr + " failed on local exception: " + error).initCause(error);
+      return new HBaseIOException("Call to " + addr + " failed on local exception: "
+        + error, error);
     }
   }
 
   static void setCancelled(Call call) {
-    call.setException(new CallCancelledException("Call id=" + call.id + ", waitTime="
+    call.setException(new CallCancelledException(call.toShortString() + ", waitTime="
         + (EnvironmentEdgeManager.currentTime() - call.getStartTime()) + ", rpcTimeout="
         + call.timeout));
   }

@@ -29,7 +29,6 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -41,7 +40,6 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
-import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.PrivilegedExceptionAction;
@@ -53,14 +51,11 @@ import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.TreeMap;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -80,6 +75,7 @@ import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.CompareOperator;
 import org.apache.hadoop.hbase.CompatibilitySingletonFactory;
 import org.apache.hadoop.hbase.DroppedSnapshotException;
+import org.apache.hadoop.hbase.ExtendedCellBuilderFactory;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
@@ -118,6 +114,7 @@ import org.apache.hadoop.hbase.client.RowMutations;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.client.TableDescriptor;
+import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
 import org.apache.hadoop.hbase.exceptions.FailedSanityCheckException;
 import org.apache.hadoop.hbase.filter.BigDecimalComparator;
@@ -150,9 +147,11 @@ import org.apache.hadoop.hbase.test.MetricsAssertHelper;
 import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.testclassification.VerySlowRegionServerTests;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManagerTestHelper;
 import org.apache.hadoop.hbase.util.FSUtils;
+import org.apache.hadoop.hbase.util.HFileArchiveUtil;
 import org.apache.hadoop.hbase.util.IncrementingEnvironmentEdge;
 import org.apache.hadoop.hbase.util.ManualEnvironmentEdge;
 import org.apache.hadoop.hbase.util.Threads;
@@ -166,7 +165,6 @@ import org.apache.hadoop.hbase.wal.WALKeyImpl;
 import org.apache.hadoop.hbase.wal.WALProvider;
 import org.apache.hadoop.hbase.wal.WALProvider.Writer;
 import org.apache.hadoop.hbase.wal.WALSplitUtil;
-import org.apache.hadoop.metrics2.MetricsExecutor;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -248,7 +246,7 @@ public class TestHRegion {
 
   @Before
   public void setup() throws IOException {
-    TEST_UTIL = HBaseTestingUtility.createLocalHTU();
+    TEST_UTIL = new HBaseTestingUtility();
     CONF = TEST_UTIL.getConfiguration();
     NettyAsyncFSWALConfigHelper.setEventLoopConfig(CONF, GROUP, NioSocketChannel.class);
     dir = TEST_UTIL.getDataTestDir("TestHRegion").toString();
@@ -401,7 +399,6 @@ public class TestHRegion {
     String testName = "testMemstoreSizeAccountingWithFailedPostBatchMutate";
     FileSystem fs = FileSystem.get(CONF);
     Path rootDir = new Path(dir + testName);
-    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
     FSHLog hLog = new FSHLog(fs, rootDir, testName, CONF);
     hLog.init();
     region = initHRegion(tableName, null, null, false, Durability.SYNC_WAL, hLog,
@@ -680,6 +677,60 @@ public class TestHRegion {
     Cell keyValue = results.get(0);
     Assert.assertTrue(Bytes.compareTo(CellUtil.cloneRow(keyValue), Bytes.toBytes("r2")) == 0);
     scanner1.close();
+  }
+
+  @Test
+  public void testArchiveRecoveredEditsReplay() throws Exception {
+    byte[] family = Bytes.toBytes("family");
+    this.region = initHRegion(tableName, method, CONF, family);
+    final WALFactory wals = new WALFactory(CONF, method);
+    try {
+      Path regiondir = region.getRegionFileSystem().getRegionDir();
+      FileSystem fs = region.getRegionFileSystem().getFileSystem();
+      byte[] regionName = region.getRegionInfo().getEncodedNameAsBytes();
+
+      Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
+
+      long maxSeqId = 1050;
+      long minSeqId = 1000;
+
+      for (long i = minSeqId; i <= maxSeqId; i += 10) {
+        Path recoveredEdits = new Path(recoveredEditsDir, String.format("%019d", i));
+        fs.create(recoveredEdits);
+        WALProvider.Writer writer = wals.createRecoveredEditsWriter(fs, recoveredEdits);
+
+        long time = System.nanoTime();
+        WALEdit edit = new WALEdit();
+        edit.add(new KeyValue(row, family, Bytes.toBytes(i), time, KeyValue.Type.Put, Bytes
+          .toBytes(i)));
+        writer.append(new WAL.Entry(new WALKeyImpl(regionName, tableName, i, time,
+          HConstants.DEFAULT_CLUSTER_ID), edit));
+
+        writer.close();
+      }
+      MonitoredTask status = TaskMonitor.get().createStatus(method);
+      Map<byte[], Long> maxSeqIdInStores = new TreeMap<>(Bytes.BYTES_COMPARATOR);
+      for (HStore store : region.getStores()) {
+        maxSeqIdInStores.put(Bytes.toBytes(store.getColumnFamilyName()), minSeqId - 1);
+      }
+      CONF.set("hbase.region.archive.recovered.edits", "true");
+      CONF.set(CommonFSUtils.HBASE_WAL_DIR, "/custom_wal_dir");
+      long seqId = region.replayRecoveredEditsIfAny(maxSeqIdInStores, null, status);
+      assertEquals(maxSeqId, seqId);
+      region.getMVCC().advanceTo(seqId);
+      String fakeFamilyName = recoveredEditsDir.getName();
+      Path rootDir = new Path(CONF.get(HConstants.HBASE_DIR));
+      Path storeArchiveDir = HFileArchiveUtil.getStoreArchivePathForRootDir(rootDir,
+        region.getRegionInfo(), Bytes.toBytes(fakeFamilyName));
+      FileStatus[] list = TEST_UTIL.getTestFileSystem().listStatus(storeArchiveDir);
+      assertEquals(6, list.length);
+    } finally {
+      CONF.set("hbase.region.archive.recovered.edits", "false");
+      CONF.set(CommonFSUtils.HBASE_WAL_DIR, "");
+      HBaseTestingUtility.closeRegionAndWAL(this.region);
+      this.region = null;
+      wals.close();
+    }
   }
 
   @Test
@@ -1238,10 +1289,9 @@ public class TestHRegion {
     this.region = initHRegion(tableName, HConstants.EMPTY_START_ROW,
       HConstants.EMPTY_END_ROW, false, Durability.USE_DEFAULT, wal, family);
     region.put(put);
-
     // 3. Test case where ABORT_FLUSH will throw exception.
     // Even if ABORT_FLUSH throws exception, we should not fail with IOE, but continue with
-    // DroppedSnapshotException. Below COMMMIT_FLUSH will cause flush to abort
+    // DroppedSnapshotException. Below COMMIT_FLUSH will cause flush to abort
     wal.flushActions = new FlushAction [] {FlushAction.COMMIT_FLUSH, FlushAction.ABORT_FLUSH};
 
     try {
@@ -2370,16 +2420,27 @@ public class TestHRegion {
     hLog.init();
     // This chunk creation is done throughout the code base. Do we want to move it into core?
     // It is missing from this test. W/o it we NPE.
-    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
     region = initHRegion(tableName, null, null, false, Durability.SYNC_WAL, hLog,
         COLUMN_FAMILY_BYTES);
 
-    Cell originalCell = CellUtil.createCell(row, COLUMN_FAMILY_BYTES, qual1,
-      System.currentTimeMillis(), KeyValue.Type.Put.getCode(), value1);
+    Cell originalCell = ExtendedCellBuilderFactory.create(CellBuilderType.DEEP_COPY)
+      .setRow(row)
+      .setFamily(COLUMN_FAMILY_BYTES)
+      .setQualifier(qual1)
+      .setTimestamp(System.currentTimeMillis())
+      .setType(KeyValue.Type.Put.getCode())
+      .setValue(value1)
+      .build();
     final long originalSize = originalCell.getSerializedSize();
 
-    Cell addCell = CellUtil.createCell(row, COLUMN_FAMILY_BYTES, qual1,
-      System.currentTimeMillis(), KeyValue.Type.Put.getCode(), Bytes.toBytes("xxxxxxxxxx"));
+    Cell addCell = ExtendedCellBuilderFactory.create(CellBuilderType.DEEP_COPY)
+      .setRow(row)
+      .setFamily(COLUMN_FAMILY_BYTES)
+      .setQualifier(qual1)
+      .setTimestamp(System.currentTimeMillis())
+      .setType(KeyValue.Type.Put.getCode())
+      .setValue(Bytes.toBytes("xxxxxxxxxx"))
+      .build();
     final long addSize = addCell.getSerializedSize();
 
     LOG.info("originalSize:" + originalSize
@@ -4126,12 +4187,16 @@ public class TestHRegion {
     try {
       FileSystem fs = Mockito.mock(FileSystem.class);
       Mockito.when(fs.exists((Path) Mockito.anyObject())).thenThrow(new IOException());
-      HTableDescriptor htd = new HTableDescriptor(tableName);
-      htd.addFamily(new HColumnDescriptor("cf"));
-      info = new HRegionInfo(htd.getTableName(), HConstants.EMPTY_BYTE_ARRAY,
-          HConstants.EMPTY_BYTE_ARRAY, false);
+      TableDescriptorBuilder tableDescriptorBuilder =
+        TableDescriptorBuilder.newBuilder(tableName);
+      ColumnFamilyDescriptor columnFamilyDescriptor =
+        ColumnFamilyDescriptorBuilder.newBuilder(Bytes.toBytes("cf")).build();
+      tableDescriptorBuilder.setColumnFamily(columnFamilyDescriptor);
+      info = new HRegionInfo(tableDescriptorBuilder.build().getTableName(),
+        HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY, false);
       Path path = new Path(dir + "testStatusSettingToAbortIfAnyExceptionDuringRegionInitilization");
-      region = HRegion.newHRegion(path, null, fs, CONF, info, htd, null);
+      region = HRegion.newHRegion(path, null, fs, CONF, info,
+        tableDescriptorBuilder.build(), null);
       // region initialization throws IOException and set task state to ABORTED.
       region.initialize();
       fail("Region initialization should fail due to IOException");
@@ -4156,13 +4221,18 @@ public class TestHRegion {
   public void testRegionInfoFileCreation() throws IOException {
     Path rootDir = new Path(dir + "testRegionInfoFileCreation");
 
-    HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name.getMethodName()));
-    htd.addFamily(new HColumnDescriptor("cf"));
+    TableDescriptorBuilder tableDescriptorBuilder =
+      TableDescriptorBuilder.newBuilder(TableName.valueOf(name.getMethodName()));
+    ColumnFamilyDescriptor columnFamilyDescriptor =
+      ColumnFamilyDescriptorBuilder.newBuilder(Bytes.toBytes("cf")).build();
+    tableDescriptorBuilder.setColumnFamily(columnFamilyDescriptor);
+    TableDescriptor tableDescriptor = tableDescriptorBuilder.build();
 
-    HRegionInfo hri = new HRegionInfo(htd.getTableName());
+    HRegionInfo hri = new HRegionInfo(tableDescriptor.getTableName());
 
     // Create a region and skip the initialization (like CreateTableHandler)
-    region = HBaseTestingUtility.createRegionAndWAL(hri, rootDir, CONF, htd, false);
+    region = HBaseTestingUtility.createRegionAndWAL(hri, rootDir, CONF,
+      tableDescriptor, false);
     Path regionDir = region.getRegionFileSystem().getRegionDir();
     FileSystem fs = region.getRegionFileSystem().getFileSystem();
     HBaseTestingUtility.closeRegionAndWAL(region);
@@ -4174,7 +4244,7 @@ public class TestHRegion {
         fs.exists(regionInfoFile));
 
     // Try to open the region
-    region = HRegion.openHRegion(rootDir, hri, htd, null, CONF);
+    region = HRegion.openHRegion(rootDir, hri, tableDescriptor, null, CONF);
     assertEquals(regionDir, region.getRegionFileSystem().getRegionDir());
     HBaseTestingUtility.closeRegionAndWAL(region);
 
@@ -4187,7 +4257,7 @@ public class TestHRegion {
     assertFalse(HRegionFileSystem.REGION_INFO_FILE + " should be removed from the region dir",
         fs.exists(regionInfoFile));
 
-    region = HRegion.openHRegion(rootDir, hri, htd, null, CONF);
+    region = HRegion.openHRegion(rootDir, hri, tableDescriptor, null, CONF);
 //    region = TEST_UTIL.openHRegion(hri, htd);
     assertEquals(regionDir, region.getRegionFileSystem().getRegionDir());
     HBaseTestingUtility.closeRegionAndWAL(region);
@@ -4509,10 +4579,9 @@ public class TestHRegion {
     put.setDurability(mutationDurability);
     region.put(put);
 
-    //verify append called or not
-    verify(wal, expectAppend ? times(1) : never())
-      .append((HRegionInfo)any(), (WALKeyImpl)any(),
-          (WALEdit)any(), Mockito.anyBoolean());
+    // verify append called or not
+    verify(wal, expectAppend ? times(1) : never()).appendData((HRegionInfo) any(),
+      (WALKeyImpl) any(), (WALEdit) any());
 
     // verify sync called or not
     if (expectSync || expectSyncFromLogSyncer) {
@@ -4868,7 +4937,6 @@ public class TestHRegion {
       String callingMethod, Configuration conf, boolean isReadOnly, byte[]... families)
       throws IOException {
     Path logDir = TEST_UTIL.getDataTestDirOnTestFS(callingMethod + ".log");
-    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
     HRegionInfo hri = new HRegionInfo(tableName, startKey, stopKey);
     final WAL wal = HBaseTestingUtility.createWal(conf, logDir, hri);
     return initHRegion(tableName, startKey, stopKey, isReadOnly,
@@ -4881,6 +4949,7 @@ public class TestHRegion {
    */
   public HRegion initHRegion(TableName tableName, byte[] startKey, byte[] stopKey,
       boolean isReadOnly, Durability durability, WAL wal, byte[]... families) throws IOException {
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
     return TEST_UTIL.createLocalHRegion(tableName, startKey, stopKey,
         isReadOnly, durability, wal, families);
   }
@@ -5621,12 +5690,10 @@ public class TestHRegion {
     final ServerName serverName = ServerName.valueOf(name.getMethodName(), 100, 42);
     final RegionServerServices rss = spy(TEST_UTIL.createMockRegionServerService(serverName));
 
-    HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name.getMethodName()));
-    htd.addFamily(new HColumnDescriptor(fam1));
-    htd.addFamily(new HColumnDescriptor(fam2));
-
-    HRegionInfo hri = new HRegionInfo(htd.getTableName(),
-      HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY);
+    TableDescriptor htd = TableDescriptorBuilder.newBuilder(TableName.valueOf(name.getMethodName()))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam1))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam2)).build();
+    RegionInfo hri = RegionInfoBuilder.newBuilder(htd.getTableName()).build();
 
     // open the region w/o rss and wal and flush some files
     region =
@@ -5643,13 +5710,13 @@ public class TestHRegion {
 
     // capture append() calls
     WAL wal = mockWAL();
-    when(rss.getWAL((HRegionInfo) any())).thenReturn(wal);
+    when(rss.getWAL(any(RegionInfo.class))).thenReturn(wal);
 
     region = HRegion.openHRegion(hri, htd, rss.getWAL(hri),
       TEST_UTIL.getConfiguration(), rss, null);
 
-    verify(wal, times(1)).append((HRegionInfo)any(), (WALKeyImpl)any()
-      , editCaptor.capture(), anyBoolean());
+    verify(wal, times(1)).appendMarker(any(RegionInfo.class), any(WALKeyImpl.class),
+      editCaptor.capture());
 
     WALEdit edit = editCaptor.getValue();
     assertNotNull(edit);
@@ -5715,15 +5782,14 @@ public class TestHRegion {
 
   /**
    * Utility method to setup a WAL mock.
+   * <p/>
    * Needs to do the bit where we close latch on the WALKeyImpl on append else test hangs.
    * @return a mock WAL
-   * @throws IOException
    */
   private WAL mockWAL() throws IOException {
     WAL wal = mock(WAL.class);
-    Mockito.when(wal.append((HRegionInfo)Mockito.any(),
-        (WALKeyImpl)Mockito.any(), (WALEdit)Mockito.any(), Mockito.anyBoolean())).
-      thenAnswer(new Answer<Long>() {
+    when(wal.appendData(any(RegionInfo.class), any(WALKeyImpl.class), any(WALEdit.class)))
+      .thenAnswer(new Answer<Long>() {
         @Override
         public Long answer(InvocationOnMock invocation) throws Throwable {
           WALKeyImpl key = invocation.getArgument(1);
@@ -5731,32 +5797,38 @@ public class TestHRegion {
           key.setWriteEntry(we);
           return 1L;
         }
-
-    });
+      });
+    when(wal.appendMarker(any(RegionInfo.class), any(WALKeyImpl.class), any(WALEdit.class))).
+        thenAnswer(new Answer<Long>() {
+          @Override
+          public Long answer(InvocationOnMock invocation) throws Throwable {
+            WALKeyImpl key = invocation.getArgument(1);
+            MultiVersionConcurrencyControl.WriteEntry we = key.getMvcc().begin();
+            key.setWriteEntry(we);
+            return 1L;
+          }
+        });
     return wal;
   }
 
   @Test
   public void testCloseRegionWrittenToWAL() throws Exception {
-
     Path rootDir = new Path(dir + name.getMethodName());
     FSUtils.setRootDir(TEST_UTIL.getConfiguration(), rootDir);
 
     final ServerName serverName = ServerName.valueOf("testCloseRegionWrittenToWAL", 100, 42);
     final RegionServerServices rss = spy(TEST_UTIL.createMockRegionServerService(serverName));
 
-    HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name.getMethodName()));
-    htd.addFamily(new HColumnDescriptor(fam1));
-    htd.addFamily(new HColumnDescriptor(fam2));
-
-    final HRegionInfo hri = new HRegionInfo(htd.getTableName(),
-      HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY);
+    TableDescriptor htd = TableDescriptorBuilder.newBuilder(TableName.valueOf(name.getMethodName()))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam1))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam2)).build();
+    RegionInfo hri = RegionInfoBuilder.newBuilder(htd.getTableName()).build();
 
     ArgumentCaptor<WALEdit> editCaptor = ArgumentCaptor.forClass(WALEdit.class);
 
     // capture append() calls
     WAL wal = mockWAL();
-    when(rss.getWAL((HRegionInfo) any())).thenReturn(wal);
+    when(rss.getWAL(any(RegionInfo.class))).thenReturn(wal);
 
 
     // create and then open a region first so that it can be closed later
@@ -5768,8 +5840,8 @@ public class TestHRegion {
     region.close(false);
 
     // 2 times, one for region open, the other close region
-    verify(wal, times(2)).append((HRegionInfo)any(), (WALKeyImpl)any(),
-      editCaptor.capture(), anyBoolean());
+    verify(wal, times(2)).appendMarker(any(RegionInfo.class),
+        (WALKeyImpl) any(WALKeyImpl.class), editCaptor.capture());
 
     WALEdit edit = editCaptor.getAllValues().get(1);
     assertNotNull(edit);
@@ -6295,45 +6367,6 @@ public class TestHRegion {
     assertTrue(plugins.contains(replicationCoprocessorClass));
     assertTrue(region.getCoprocessorHost().
         getCoprocessors().contains(ReplicationObserver.class.getSimpleName()));
-  }
-
-  // make sure region is success close when coprocessor wrong region open failed
-  @Test
-  public void testOpenRegionFailedMemoryLeak() throws Exception {
-    final ServerName serverName = ServerName.valueOf("testOpenRegionFailed", 100, 42);
-    final RegionServerServices rss = spy(TEST_UTIL.createMockRegionServerService(serverName));
-
-    HTableDescriptor htd
-      = new HTableDescriptor(TableName.valueOf("testOpenRegionFailed"));
-    htd.addFamily(new HColumnDescriptor(fam1));
-    htd.setValue("COPROCESSOR$1", "hdfs://test/test.jar|test||");
-
-    HRegionInfo hri = new HRegionInfo(htd.getTableName(),
-      HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY);
-    ScheduledExecutorService executor = CompatibilitySingletonFactory.
-      getInstance(MetricsExecutor.class).getExecutor();
-    for (int i = 0; i < 20 ; i++) {
-      try {
-        HRegion.openHRegion(hri, htd, rss.getWAL(hri),
-          TEST_UTIL.getConfiguration(), rss, null);
-      }catch(Throwable t){
-        LOG.info("Expected exception, continue");
-      }
-    }
-    TimeUnit.SECONDS.sleep(MetricsRegionWrapperImpl.PERIOD);
-    Field[] fields = ThreadPoolExecutor.class.getDeclaredFields();
-    boolean found = false;
-    for(Field field : fields){
-      if(field.getName().equals("workQueue")){
-        field.setAccessible(true);
-        BlockingQueue<Runnable> workQueue = (BlockingQueue<Runnable>)field.get(executor);
-        //there are still two task not cancel, can not cause to memory lack
-        Assert.assertTrue("ScheduledExecutor#workQueue should equals 2, now is " +
-          workQueue.size() + ", please check region is close", 2 == workQueue.size());
-        found = true;
-      }
-    }
-    Assert.assertTrue("can not find workQueue, test failed", found);
   }
 
   /**

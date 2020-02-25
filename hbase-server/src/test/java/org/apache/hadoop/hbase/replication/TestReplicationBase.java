@@ -24,6 +24,7 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -75,8 +76,8 @@ public class TestReplicationBase {
 
   protected static final HBaseTestingUtility UTIL1 = new HBaseTestingUtility();
   protected static final HBaseTestingUtility UTIL2 = new HBaseTestingUtility();
-  protected static final Configuration CONF1 = UTIL1.getConfiguration();
-  protected static final Configuration CONF2 = UTIL2.getConfiguration();
+  protected static Configuration CONF1 = UTIL1.getConfiguration();
+  protected static Configuration CONF2 = UTIL2.getConfiguration();
 
   protected static final int NUM_SLAVES1 = 2;
   protected static final int NUM_SLAVES2 = 4;
@@ -138,6 +139,11 @@ public class TestReplicationBase {
 
   protected static void waitForReplication(int expectedRows, int retries)
       throws IOException, InterruptedException {
+    waitForReplication(htable2, expectedRows, retries);
+  }
+
+  protected static void waitForReplication(Table htable2, int expectedRows, int retries)
+      throws IOException, InterruptedException {
     Scan scan;
     for (int i = 0; i < retries; i++) {
       scan = new Scan();
@@ -170,7 +176,7 @@ public class TestReplicationBase {
     htable1.put(puts);
   }
 
-  private static void setupConfig(HBaseTestingUtility util, String znodeParent) {
+  protected static void setupConfig(HBaseTestingUtility util, String znodeParent) {
     Configuration conf = util.getConfiguration();
     conf.set(HConstants.ZOOKEEPER_ZNODE_PARENT, znodeParent);
     // We don't want too many edits per batch sent to the ReplicationEndpoint to trigger
@@ -204,13 +210,27 @@ public class TestReplicationBase {
     conf2.setBoolean("hbase.tests.use.shortcircuit.reads", false);
   }
 
-  protected static void restartHBaseCluster(HBaseTestingUtility util, int numSlaves)
+  static void restartSourceCluster(int numSlaves)
       throws Exception {
-    util.shutdownMiniHBaseCluster();
-    util.restartHBaseCluster(numSlaves);
+    IOUtils.closeQuietly(hbaseAdmin, htable1);
+    UTIL1.shutdownMiniHBaseCluster();
+    UTIL1.restartHBaseCluster(numSlaves);
+    // Invalidate the cached connection state.
+    CONF1 = UTIL1.getConfiguration();
+    hbaseAdmin = UTIL1.getAdmin();
+    Connection connection1 = UTIL1.getConnection();
+    htable1 = connection1.getTable(tableName);
   }
 
-  protected static void startClusters() throws Exception {
+  static void restartTargetHBaseCluster(int numSlaves) throws Exception {
+    IOUtils.closeQuietly(htable2);
+    UTIL2.restartHBaseCluster(numSlaves);
+    // Invalidate the cached connection state
+    CONF2 = UTIL2.getConfiguration();
+    htable2 = UTIL2.getConnection().getTable(tableName);
+  }
+
+  private static void startClusters() throws Exception {
     UTIL1.startMiniZKCluster();
     MiniZooKeeperCluster miniZK = UTIL1.getZkCluster();
     LOG.info("Setup first Zk");
@@ -337,8 +357,12 @@ public class TestReplicationBase {
 
   @AfterClass
   public static void tearDownAfterClass() throws Exception {
-    htable2.close();
-    htable1.close();
+    if (htable2 != null) {
+      htable2.close();
+    }
+    if (htable1 != null) {
+      htable1.close();
+    }
     UTIL2.shutdownMiniCluster();
     UTIL1.shutdownMiniCluster();
   }

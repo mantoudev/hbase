@@ -260,6 +260,73 @@ For region name, we only accept `byte[]` as the parameter type and it may be a f
 
 Information on non-Java clients and custom protocols is covered in <<external_apis>>
 
+[[client.masterregistry]]
+=== Master registry (new as of release 3.0.0)
+
+Client internally works with a _connection registry_ to fetch the metadata needed by connections.
+This connection registry implementation is responsible for fetching the following metadata.
+
+* Active master address
+* Current meta region(s) locations
+* Cluster ID (unique to this cluster)
+
+This information is needed as a part of various client operations like connection set up, scans,
+gets etc. Up until releases 2.x.y, the default connection registry is based on ZooKeeper as the
+source of truth and the the clients fetched the metadata from zookeeper znodes. As of release 3.0.0,
+the default implementation for connection registry has been switched  to a master based
+implementation. With this change, the clients now fetch the required metadata from master RPC end
+points directly. This change was done for the following reasons.
+
+* Reduce load on ZooKeeper since that is critical for cluster operation.
+* Holistic client timeout and retry configurations since the new registry brings all the client
+operations under HBase rpc framework.
+* Remove the ZooKeeper client dependency on HBase client library.
+
+This means that
+
+* At least a single active or stand by master is needed for cluster connection setup. Refer to
+<<master.runtime>> for more details.
+* Master can be in a critical path of read/write operations, especially if the client metadata cache
+is empty or stale.
+* There is higher connection load on the masters that before since the clients talk directly to
+HMasters instead of ZooKeeper ensemble`
+
+To reduce hot-spotting on a single master, all the masters (active & stand-by) expose the needed
+service to fetch the connection metadata. This lets the client connect to any master (not just active).
+
+==== RPC hedging
+
+This feature also implements an new RPC channel that can hedge requests to multiple masters. This
+lets the client make the same request to multiple servers and which ever responds first is returned
+back to the client and the other other in-flight requests are canceled. This improves the
+performance, especially when a subset of servers are under load. The hedging fan out size is
+configurable, meaning the number of requests that are hedged in a single attempt, using the
+configuration key _hbase.rpc.hedged.fanout_ in the client configuration. It defaults to 2. With this
+default, the RPCs are tried in batches of 2. The hedging policy is still primitive and does not
+adapt to any sort of live rpc performance metrics.
+
+==== Additional Notes
+
+* Clients hedge the requests in a randomized order to avoid hot-spotting a single server.
+* Cluster internal connections (master<->regionservers) still use ZooKeeper based connection
+registry.
+* Cluster internal state is still tracked in Zookeeper, hence ZK availability requirements are same
+as before.
+* Inter cluster replication still uses ZooKeeper based connection registry to simplify configuration
+management.
+
+For more implementation details, please refer to the https://github.com/apache/hbase/tree/master/dev-support/design-docs[design doc] and
+https://issues.apache.org/jira/browse/HBASE-18095[HBASE-18095].
+
+'''
+NOTE: (Advanced) In case of any issues with the master based registry, use the following
+configuration to fallback to the ZooKeeper based connection registry implementation.
+[source, xml]
+<property>
+    <name>hbase.client.registry.impl</name>
+    <value>org.apache.hadoop.hbase.client.ZKConnectionRegistry</value>
+ </property>
+
 [[client.filter]]
 == Client Request Filters
 
@@ -410,6 +477,20 @@ See link:https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/filter/BinaryP
 
 See link:https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/filter/BinaryComparator.html[BinaryComparator].
 
+[[client.filter.cvp.bcc]]
+==== BinaryComponentComparator
+
+link:https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/filter/BinaryComponentComparator.html[BinaryComponentComparator] can be used to compare specific value at specific location with in the cell value. The comparison can be done for both ascii and binary data.
+
+[source,java]
+----
+byte[] partialValue = Bytes.toBytes("partial_value");
+    int partialValueOffset =
+    Filter partialValueFilter = new ValueFilter(CompareFilter.CompareOp.GREATER,
+            new BinaryComponentComparator(partialValue,partialValueOffset));
+----
+See link:https://issues.apache.org/jira/browse/HBASE-22969[HBASE-22969] for other use cases and details.
+
 [[client.filter.kvm]]
 === KeyValue Metadata
 
@@ -535,6 +616,8 @@ Note:  Introduced in HBase 0.92
 
 It is generally a better idea to use the startRow/stopRow methods on Scan for row selection, however link:https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/filter/RowFilter.html[RowFilter] can also be used.
 
+You can supplement a scan (both bounded and unbounded) with RowFilter constructed from link:https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/filter/BinaryComponentComparator.html[BinaryComponentComparator] for further filtering out or filtering in rows. See link:https://issues.apache.org/jira/browse/HBASE-22969[HBASE-22969] for use cases and other details.
+
 [[client.filter.utility]]
 === Utility
 
@@ -561,10 +644,23 @@ If the active Master loses its lease in ZooKeeper (or the Master shuts down), th
 [[master.runtime]]
 === Runtime Impact
 
-A common dist-list question involves what happens to an HBase cluster when the Master goes down.
+A common dist-list question involves what happens to an HBase cluster when the Master goes down. This information has changed staring 3.0.0.
+
+==== Up until releases 2.x.y
 Because the HBase client talks directly to the RegionServers, the cluster can still function in a "steady state". Additionally, per <<arch.catalog>>, `hbase:meta` exists as an HBase table and is not resident in the Master.
 However, the Master controls critical functions such as RegionServer failover and completing region splits.
 So while the cluster can still run for a short time without the Master, the Master should be restarted as soon as possible.
+
+==== Staring release 3.0.0
+As mentioned in section <<client.masterregistry>>, the default connection registry for clients is now based on master rpc end points. Hence the requirements for
+masters' uptime are even tighter starting this release.
+
+- At least one active or stand by master is needed for a connection set up, unlike before when all the clients needed was a ZooKeeper ensemble.
+- Master is now in critical path for read/write operations. For example, if the meta region bounces off to a different region server, clients
+need master to fetch the new locations. Earlier this was done by fetching this information directly from ZooKeeper.
+- Masters will now have higher connection load than before. So, the server side configuration might need adjustment depending on the load.
+
+Overall, the master uptime requirements, when this feature is enabled, are even higher for the client operations to go through.
 
 [[master.api]]
 === Interface
@@ -837,7 +933,7 @@ Here are two use cases:
   Setting block caching on such a table is a waste of memory and CPU cycles, more so that it will generate more garbage to pick up by the JVM.
   For more information on monitoring GC, see <<trouble.log.gc>>.
 * Mapping a table: In a typical MapReduce job that takes a table in input, every row will be read only once so there's no need to put them into the block cache.
-  The Scan object has the option of turning this off via the setCaching method (set it to false). You can still keep block caching turned on on this table if you need fast random read access.
+  The Scan object has the option of turning this off via the setCacheBlocks method (set it to false). You can still keep block caching turned on on this table if you need fast random read access.
   An example would be counting the number of rows in a table that serves live traffic, caching every block of that table would create massive churn and would surely evict data that's currently in use.
 
 [[data.blocks.in.fscache]]
@@ -889,8 +985,9 @@ benefit of NOT provoking GC.
 From HBase 2.0.0 onwards, the notions of L1 and L2 have been deprecated. When BucketCache is turned on, the DATA blocks will always go to BucketCache and INDEX/BLOOM blocks go to on heap LRUBlockCache. `cacheDataInL1` support hase been removed.
 ====
 
-The BucketCache Block Cache can be deployed _off-heap_, _file_ or _mmaped_ file mode.
-
+[[bc.deloy.modes]]
+====== BucketCache Deploy Modes
+The BucketCache Block Cache can be deployed _offheap_, _file_ or _mmaped_ file mode.
 
 You set which via the `hbase.bucketcache.ioengine` setting.
 Setting it to `offheap` will have BucketCache make its allocations off-heap, and an ioengine setting of `file:PATH_TO_FILE` will direct BucketCache to use file caching (Useful in particular if you have some fast I/O attached to the box such as SSDs). From 2.0.0, it is possible to have more than one file backing the BucketCache. This is very useful specially when the Cache size requirement is high. For multiple backing files, configure ioengine as `files:PATH_TO_FILE1,PATH_TO_FILE2,PATH_TO_FILE3`. BucketCache can be configured to use an mmapped file also. Configure ioengine as `mmap:PATH_TO_FILE` for this.
@@ -909,6 +1006,7 @@ See the link:https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/io/hfil
 To check it enabled, look for the log line describing cache setup; it will detail how BucketCache has been deployed.
 Also see the UI. It will detail the cache tiering and their configuration.
 
+[[bc.example]]
 ====== BucketCache Example Configuration
 This sample provides a configuration for a 4 GB off-heap BucketCache with a 1 GB on-heap cache.
 
@@ -1265,6 +1363,26 @@ It is possible to set _durability_ on each Mutation or on a Table basis. Options
 
 Do not confuse the _ASYNC_WAL_ option on a Mutation or Table with the _AsyncFSWAL_ writer; they are distinct
 options unfortunately closely named
+
+[[arch.custom.wal.dir]]
+==== Custom WAL Directory
+HBASE-17437 added support for specifying a WAL directory outside the HBase root directory or even in a different FileSystem since 1.3.3/2.0+. Some FileSystems (such as Amazon S3) don’t support append or consistent writes, in such scenario WAL directory needs to be configured in a different FileSystem to avoid loss of writes.
+
+Following configurations are added to accomplish this:
+
+. `hbase.wal.dir`
++
+This defines where the root WAL directory is located, could be on a different FileSystem than the root directory. WAL directory can not be set to a subdirectory of the root directory. The default value of this is the root directory if unset.
+
+. `hbase.rootdir.perms`
++
+Configures FileSystem permissions to set on the root directory. This is '700' by default.
+
+. `hbase.wal.dir.perms`
++
+Configures FileSystem permissions to set on the WAL directory FileSystem. This is '700' by default.
+
+NOTE: While migrating to custom WAL dir (outside the HBase root directory or a different FileSystem) existing WAL files must be copied manually to new WAL dir, otherwise it may lead to data loss/inconsistency as HMaster has no information about previous WAL directory.
 
 [[wal.disable]]
 ==== Disabling the WAL
@@ -2410,8 +2528,8 @@ To control these for stripe compactions, use `hbase.store.stripe.compaction.minF
 HBase includes several methods of loading data into tables.
 The most straightforward method is to either use the `TableOutputFormat` class from a MapReduce job, or use the normal client APIs; however, these are not always the most efficient methods.
 
-The bulk load feature uses a MapReduce job to output table data in HBase's internal data format, and then directly loads the generated StoreFiles into a running cluster.
-Using bulk load will use less CPU and network resources than simply using the HBase API.
+The bulk load feature uses a MapReduce job to output table data in HBase's internal data format, and then directly load the generated StoreFiles into a running cluster.
+Using bulk load will use less CPU and network resources than loading via the HBase API.
 
 [[arch.bulk.load.arch]]
 === Bulk Load Architecture
@@ -2422,7 +2540,7 @@ The HBase bulk load process consists of two main steps.
 ==== Preparing data via a MapReduce job
 
 The first step of a bulk load is to generate HBase data files (StoreFiles) from a MapReduce job using `HFileOutputFormat2`.
-This output format writes out data in HBase's internal storage format so that they can be later loaded very efficiently into the cluster.
+This output format writes out data in HBase's internal storage format so that they can be later loaded efficiently into the cluster.
 
 In order to function efficiently, `HFileOutputFormat2` must be configured such that each output HFile fits within a single region.
 In order to do this, jobs whose output will be bulk loaded into HBase use Hadoop's `TotalOrderPartitioner` class to partition the map output into disjoint ranges of the key space, corresponding to the key ranges of the regions in the table.
@@ -2439,22 +2557,20 @@ It then contacts the appropriate RegionServer which adopts the HFile, moving it 
 If the region boundaries have changed during the course of bulk load preparation, or between the preparation and completion steps, the `completebulkload` utility will automatically split the data files into pieces corresponding to the new boundaries.
 This process is not optimally efficient, so users should take care to minimize the delay between preparing a bulk load and importing it into the cluster, especially if other clients are simultaneously loading data through other means.
 
+[[arch.bulk.load.complete.help]]
 [source,bash]
 ----
-$ hadoop jar hbase-server-VERSION.jar completebulkload [-c /path/to/hbase/config/hbase-site.xml] /user/todd/myoutput mytable
+$ hadoop jar hbase-mapreduce-VERSION.jar completebulkload [-c /path/to/hbase/config/hbase-site.xml] /user/todd/myoutput mytable
 ----
 
 The `-c config-file` option can be used to specify a file containing the appropriate hbase parameters (e.g., hbase-site.xml) if not supplied already on the CLASSPATH (In addition, the CLASSPATH must contain the directory that has the zookeeper configuration file if zookeeper is NOT managed by HBase).
-
-NOTE: If the target table does not already exist in HBase, this tool will create the table automatically.
-
 
 [[arch.bulk.load.also]]
 === See Also
 
 For more information about the referenced utilities, see <<importtsv>> and  <<completebulkload>>.
 
-See link:http://blog.cloudera.com/blog/2013/09/how-to-use-hbase-bulk-loading-and-why/[How-to: Use HBase Bulk Loading, and Why] for a recent blog on current state of bulk loading.
+See link:http://blog.cloudera.com/blog/2013/09/how-to-use-hbase-bulk-loading-and-why/[How-to: Use HBase Bulk Loading, and Why] for an old blog post on loading.
 
 [[arch.bulk.load.adv]]
 === Advanced Usage
@@ -2464,6 +2580,53 @@ To get started doing so, dig into `ImportTsv.java` and check the JavaDoc for HFi
 
 The import step of the bulk load can also be done programmatically.
 See the `LoadIncrementalHFiles` class for more information.
+
+[[arch.bulk.load.complete.strays]]
+==== 'Adopting' Stray Data
+Should an HBase cluster lose account of regions or files during an outage or error, you can use
+the `completebulkload` tool to add back the dropped data. HBase operator tooling such as
+link:https://github.com/apache/hbase-operator-tools/tree/master/hbase-hbck2[HBCK2] or
+the reporting added to the Master's UI under the `HBCK Report` (Since HBase 2.0.6/2.1.6/2.2.1)
+can identify such 'orphan' directories.
+
+Before you begin the 'adoption', ensure the `hbase:meta` table is in a healthy state.
+Run the `CatalogJanitor` by executing the `catalogjanitor_run` command on the HBase shell.
+When finished, check the `HBCK Report` page on the Master UI. Work on fixing any
+inconsistencies, holes, or overlaps found before proceeding. The `hbase:meta` table
+is the authority on where all data is to be found and must be consistent for
+the `completebulkload` tool to work properly.
+
+The `completebulkload` tool takes a directory and a `tablename`.
+The directory has subdirectories named for column families of the targeted `tablename`.
+In these subdirectories are `hfiles` to load. Given this structure, you can pass
+errant region directories (and the table name to which the region directory belongs)
+and the tool will bring the data files back into the fold by moving them under the
+approprate serving directory. If stray files, then you will need to mock up this
+structure before invoking the `completebulkload` tool; you may have to look at the
+file content using the <<hfile.tool>> to see what the column family to use is.
+When the tool completes its run, you will notice that the
+source errant directory has had its storefiles moved/removed. It is now desiccated
+since its data has been drained, and the pointed-to directory can be safely
+removed. It may still have `.regioninfo` files and other
+subdirectories but they are of no relevance now (There may be content still
+under the _recovered_edits_ directory; a TODO is tooling to replay the
+content of _recovered_edits_ if needed; see
+link:https://issues.apache.org/jira/browse/HBASE-22976[Add RecoveredEditsPlayer]).
+If you pass `completebulkload` a directory without store files, it will run and
+note the directory is storefile-free. Just remove such 'empty' directories.
+
+For example, presuming a directory at the top level in HDFS named
+`eb3352fb5c9c9a05feeb2caba101e1cc` has data we need to re-add to the
+HBase `TestTable`:
+
+[source,bash]
+----
+$ ${HBASE_HOME}/bin/hbase --config ~/hbase-conf completebulkload hdfs://server.example.org:9000/eb3352fb5c9c9a05feeb2caba101e1cc TestTable
+----
+
+After it successfully completes, any files that were in  `eb3352fb5c9c9a05feeb2caba101e1cc` have been moved
+under hbase and the  `eb3352fb5c9c9a05feeb2caba101e1cc` directory can be deleted (Check content
+before and after by running `ls -r` on the HDFS directory).
 
 [[arch.bulk.load.replication]]
 === Bulk Loading Replication
@@ -2490,26 +2653,6 @@ This configuration is required in the cluster where replication for bulk loaded 
 For example: If source cluster FS client configurations are copied to the destination cluster under directory `/home/user/dc1/`, then `hbase.replication.cluster.id` should be configured as `dc1` and `hbase.replication.conf.dir` as `/home/user`.
 
 NOTE: `DefaultSourceFSConfigurationProvider` supports only `xml` type files. It loads source cluster FS client configuration only once, so if source cluster FS client configuration files are updated, every peer(s) cluster RS must be restarted to reload the configuration.
-
-[[arch.custom.wal.dir]]
-=== Custom WAL Directory
-HBASE-17437 added support for specifying a WAL directory outside the HBase root directory or even in a different FileSystem since 1.3.3/2.0+. Some FileSystems (such as Amazon S3) don’t support append or consistent writes, in such scenario WAL directory needs to be configured in a different FileSystem to avoid loss of writes.
-
-Following configurations are added to accomplish this:
-
-. `hbase.wal.dir`
-+
-This defines where the root WAL directory is located, could be on a different FileSystem than the root directory. WAL directory can not be set to a subdirectory of the root directory. The default value of this is the root directory if unset.
-
-. `hbase.rootdir.perms`
-+
-Configures FileSystem permissions to set on the root directory. This is '700' by default.
-
-. `hbase.wal.dir.perms`
-+
-Configures FileSystem permissions to set on the WAL directory FileSystem. This is '700' by default.
-
-NOTE: While migrating to custom WAL dir (outside the HBase root directory or a different FileSystem) existing WAL files must be copied manually to new WAL dir, otherwise it may lead to data loss/inconsistency as HMaster has no information about previous WAL directory.
 
 [[arch.hdfs]]
 == HDFS

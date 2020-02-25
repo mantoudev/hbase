@@ -50,8 +50,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.RegionSpeci
 @InterfaceAudience.Private
 class AsyncClusterConnectionImpl extends AsyncConnectionImpl implements AsyncClusterConnection {
 
-  public AsyncClusterConnectionImpl(Configuration conf, AsyncRegistry registry, String clusterId,
-      SocketAddress localAddress, User user) {
+  public AsyncClusterConnectionImpl(Configuration conf, ConnectionRegistry registry,
+      String clusterId, SocketAddress localAddress, User user) {
     super(conf, registry, clusterId, localAddress, user);
   }
 
@@ -108,14 +108,14 @@ class AsyncClusterConnectionImpl extends AsyncConnectionImpl implements AsyncClu
 
   @Override
   public CompletableFuture<Boolean> bulkLoad(TableName tableName,
-      List<Pair<byte[], String>> familyPaths, byte[] row, boolean assignSeqNum, Token<?> userToken,
-      String bulkToken, boolean copyFiles) {
+    List<Pair<byte[], String>> familyPaths, byte[] row, boolean assignSeqNum, Token<?> userToken,
+    String bulkToken, boolean copyFiles, List<String> clusterIds, boolean replicate) {
     return callerFactory.<Boolean> single().table(tableName).row(row)
       .action((controller, loc, stub) -> ConnectionUtils
         .<Void, BulkLoadHFileRequest, BulkLoadHFileResponse, Boolean> call(controller, loc, stub,
           null,
           (rn, nil) -> RequestConverter.buildBulkLoadHFileRequest(familyPaths, rn, assignSeqNum,
-            userToken, bulkToken, copyFiles),
+            userToken, bulkToken, copyFiles, clusterIds, replicate),
           (s, c, req, done) -> s.bulkLoadHFile(c, req, done), (c, resp) -> resp.getLoaded()))
       .call();
   }

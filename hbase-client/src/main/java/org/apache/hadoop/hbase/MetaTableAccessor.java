@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Objects;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.regex.Matcher;
@@ -58,8 +59,6 @@ import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;
-import org.apache.hadoop.hbase.filter.QualifierFilter;
-import org.apache.hadoop.hbase.filter.RegexStringComparator;
 import org.apache.hadoop.hbase.filter.RowFilter;
 import org.apache.hadoop.hbase.filter.SubstringComparator;
 import org.apache.hadoop.hbase.ipc.CoprocessorRpcUtils;
@@ -138,7 +137,7 @@ import org.apache.hbase.thirdparty.com.google.common.base.Throwables;
  *                             columns: info:merge0001, info:merge0002. You make also see 'mergeA',
  *                             and 'mergeB'. This is old form replaced by the new format that allows
  *                             for more than two parents to be merged at a time.
- * TODO: Add rep_barrier for serial replication explaination.
+ * TODO: Add rep_barrier for serial replication explaination. See SerialReplicationChecker.
  * </pre>
  * </p>
  * <p>
@@ -232,13 +231,13 @@ public class MetaTableAccessor {
    * Callers should call close on the returned {@link Table} instance.
    * @param connection connection we're using to access Meta
    * @return An {@link Table} for <code>hbase:meta</code>
+   * @throws NullPointerException if {@code connection} is {@code null}
    */
   public static Table getMetaHTable(final Connection connection)
   throws IOException {
     // We used to pass whole CatalogTracker in here, now we just pass in Connection
-    if (connection == null) {
-      throw new NullPointerException("No connection");
-    } else if (connection.isClosed()) {
+    Objects.requireNonNull(connection, "Connection cannot be null");
+    if (connection.isClosed()) {
       throw new IOException("connection is closed");
     }
     return connection.getTable(TableName.META_TABLE_NAME);
@@ -305,11 +304,18 @@ public class MetaTableAccessor {
    */
   public static HRegionLocation getRegionLocation(Connection connection, RegionInfo regionInfo)
       throws IOException {
-    byte[] row = getMetaKeyForRegion(regionInfo);
-    Get get = new Get(row);
+    return getRegionLocation(getCatalogFamilyRow(connection, regionInfo),
+        regionInfo, regionInfo.getReplicaId());
+  }
+
+  /**
+   * @return Return the {@link HConstants#CATALOG_FAMILY} row from hbase:meta.
+   */
+  public static Result getCatalogFamilyRow(Connection connection, RegionInfo ri)
+      throws IOException {
+    Get get = new Get(getMetaKeyForRegion(ri));
     get.addFamily(HConstants.CATALOG_FAMILY);
-    Result r = get(getMetaHTable(connection), get);
-    return getRegionLocation(r, regionInfo, regionInfo.getReplicaId());
+    return get(getMetaHTable(connection), get);
   }
 
   /** Returns the row key to use for this regionInfo */
@@ -321,6 +327,7 @@ public class MetaTableAccessor {
    * is stored in the name, so the returned object should only be used for the fields
    * in the regionName.
    */
+  // This should be moved to RegionInfo? TODO.
   public static RegionInfo parseRegionInfoFromRegionName(byte[] regionName) throws IOException {
     byte[][] fields = RegionInfo.parseRegionName(regionName);
     long regionId = Long.parseLong(Bytes.toString(fields[2]));
@@ -373,7 +380,7 @@ public class MetaTableAccessor {
   @Nullable
   public static List<RegionInfo> getMergeRegions(Connection connection, byte[] regionName)
       throws IOException {
-    return getMergeRegions(getMergeRegionsRaw(connection, regionName));
+    return getMergeRegions(getRegionResult(connection, regionName).rawCells());
   }
 
   /**
@@ -424,31 +431,6 @@ public class MetaTableAccessor {
     // Check to see if has family and that qualifier starts with the merge qualifier 'merge'
     return CellUtil.matchingFamily(cell, HConstants.CATALOG_FAMILY) &&
       PrivateCellUtil.qualifierStartsWith(cell, HConstants.MERGE_QUALIFIER_PREFIX);
-  }
-
-  /**
-   * @return Array of Cells made from all columns on the <code>regionName</code> row
-   *   that match the regex 'info:merge.*'.
-   */
-  @Nullable
-  private static Cell [] getMergeRegionsRaw(Connection connection, byte [] regionName)
-      throws IOException {
-    Scan scan = new Scan().withStartRow(regionName).
-        setOneRowLimit().
-        readVersions(1).
-        addFamily(HConstants.CATALOG_FAMILY).
-        setFilter(new QualifierFilter(CompareOperator.EQUAL,
-          new RegexStringComparator(HConstants.MERGE_QUALIFIER_PREFIX_STR+ ".*")));
-    try (Table m = getMetaHTable(connection); ResultScanner scanner = m.getScanner(scan)) {
-      // Should be only one result in this scanner if any.
-      Result result = scanner.next();
-      if (result == null) {
-        return null;
-      }
-      // Should be safe to just return all Cells found since we had filter in place.
-      // All values should be RegionInfos or something wrong.
-      return result.rawCells();
-    }
   }
 
   /**
@@ -634,6 +616,7 @@ public class MetaTableAccessor {
    * @param excludeOfflinedSplitParents don't return split parents
    * @return Return list of regioninfos and server addresses.
    */
+  // What happens here when 1M regions in hbase:meta? This won't scale?
   public static List<Pair<RegionInfo, ServerName>> getTableRegionsAndLocations(
       Connection connection, @Nullable final TableName tableName,
       final boolean excludeOfflinedSplitParents) throws IOException {
@@ -1133,6 +1116,7 @@ public class MetaTableAccessor {
 
   /**
    * Updates state in META
+   * Do not use. For internal use only.
    * @param conn connection to use
    * @param tableName table to look for
    */
@@ -1274,9 +1258,7 @@ public class MetaTableAccessor {
    * Generates and returns a Put containing the region into for the catalog table
    */
   public static Put makePutFromRegionInfo(RegionInfo regionInfo, long ts) throws IOException {
-    Put put = new Put(regionInfo.getRegionName(), ts);
-    addRegionInfo(put, regionInfo);
-    return put;
+    return addRegionInfo(new Put(regionInfo.getRegionName(), ts), regionInfo);
   }
 
   /**
@@ -1414,7 +1396,7 @@ public class MetaTableAccessor {
     }
   }
 
-  private static void addRegionStateToPut(Put put, RegionState.State state) throws IOException {
+  private static Put addRegionStateToPut(Put put, RegionState.State state) throws IOException {
     put.add(CellBuilderFactory.create(CellBuilderType.SHALLOW_COPY)
         .setRow(put.getRow())
         .setFamily(HConstants.CATALOG_FAMILY)
@@ -1423,6 +1405,17 @@ public class MetaTableAccessor {
         .setType(Cell.Type.Put)
         .setValue(Bytes.toBytes(state.name()))
         .build());
+    return put;
+  }
+
+  /**
+   * Update state column in hbase:meta.
+   */
+  public static void updateRegionState(Connection connection, RegionInfo ri,
+      RegionState.State state) throws IOException {
+    Put put = new Put(RegionReplicaUtil.getRegionInfoForDefaultReplica(ri).getRegionName());
+    MetaTableAccessor.putsToMetaTable(connection,
+        Collections.singletonList(addRegionStateToPut(put, state)));
   }
 
   /**
@@ -1655,7 +1648,7 @@ public class MetaTableAccessor {
    * Construct PUT for given state
    * @param state new state
    */
-  private static Put makePutFromTableState(TableState state, long ts) {
+  public static Put makePutFromTableState(TableState state, long ts) {
     Put put = new Put(state.getTableName().getName(), ts);
     put.addColumn(getTableFamily(), getTableStateColumn(), state.convert().toByteArray());
     return put;
@@ -1837,21 +1830,23 @@ public class MetaTableAccessor {
       throws IOException {
     Delete delete = new Delete(mergeRegion.getRegionName());
     // NOTE: We are doing a new hbase:meta read here.
-    Cell [] cells = getMergeRegionsRaw(connection, mergeRegion.getRegionName());
+    Cell[] cells = getRegionResult(connection, mergeRegion.getRegionName()).rawCells();
     if (cells == null || cells.length == 0) {
       return;
     }
-    List<byte[]> qualifiers = new ArrayList<>(cells.length);
+    List<byte[]> qualifiers = new ArrayList<>();
     for (Cell cell : cells) {
+      if (!isMergeQualifierPrefix(cell)) {
+        continue;
+      }
       byte[] qualifier = CellUtil.cloneQualifier(cell);
       qualifiers.add(qualifier);
       delete.addColumns(getCatalogFamily(), qualifier, HConstants.LATEST_TIMESTAMP);
     }
     deleteFromMetaTable(connection, delete);
     LOG.info("Deleted merge references in " + mergeRegion.getRegionNameAsString() +
-        ", deleted qualifiers " +
-        qualifiers.stream().map(Bytes::toStringBinary).
-            collect(Collectors.joining(", ")));
+        ", deleted qualifiers " + qualifiers.stream().map(Bytes::toStringBinary).
+        collect(Collectors.joining(", ")));
   }
 
   public static Put addRegionInfo(final Put p, final RegionInfo hri)
@@ -1862,7 +1857,10 @@ public class MetaTableAccessor {
         .setQualifier(HConstants.REGIONINFO_QUALIFIER)
         .setTimestamp(p.getTimestamp())
         .setType(Type.Put)
-        .setValue(RegionInfo.toByteArray(hri))
+        // Serialize the Default Replica HRI otherwise scan of hbase:meta
+        // shows an info:regioninfo value with encoded name and region
+        // name that differs from that of the hbase;meta row.
+        .setValue(RegionInfo.toByteArray(RegionReplicaUtil.getRegionInfoForDefaultReplica(hri)))
         .build());
     return p;
   }
@@ -1953,6 +1951,9 @@ public class MetaTableAccessor {
     return put;
   }
 
+  /**
+   * See class comment on SerialReplicationChecker
+   */
   public static void addReplicationBarrier(Put put, long openSeqNum) throws IOException {
     put.add(CellBuilderFactory.create(CellBuilderType.SHALLOW_COPY)
       .setRow(put.getRow())

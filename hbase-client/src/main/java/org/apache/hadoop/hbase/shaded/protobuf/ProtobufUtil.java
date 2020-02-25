@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -35,6 +35,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NavigableSet;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -79,6 +80,8 @@ import org.apache.hadoop.hbase.client.PackagePrivateFieldAccessor;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.RegionLoadStats;
+import org.apache.hadoop.hbase.client.RegionReplicaUtil;
+import org.apache.hadoop.hbase.client.RegionStatesCount;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.SnapshotDescription;
@@ -91,6 +94,7 @@ import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.filter.ByteArrayComparable;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.io.TimeRange;
+import org.apache.hadoop.hbase.master.RegionState;
 import org.apache.hadoop.hbase.protobuf.ProtobufMagic;
 import org.apache.hadoop.hbase.protobuf.ProtobufMessageConverter;
 import org.apache.hadoop.hbase.quotas.QuotaScope;
@@ -131,7 +135,6 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetOnlineRe
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetOnlineRegionResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetRegionInfoRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetRegionInfoResponse;
-import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetRegionLoadResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetServerInfoRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetServerInfoResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetStoreFileRequest;
@@ -373,7 +376,9 @@ public final class ProtobufUtil {
    * @see #toServerName(org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.ServerName)
    */
   public static HBaseProtos.ServerName toServerName(final ServerName serverName) {
-    if (serverName == null) return null;
+    if (serverName == null) {
+      return null;
+    }
     HBaseProtos.ServerName.Builder builder =
       HBaseProtos.ServerName.newBuilder();
     builder.setHostName(serverName.getHostname());
@@ -1713,35 +1718,33 @@ public final class ProtobufUtil {
 // Start helpers for Admin
 
   /**
-   * A helper to retrieve region info given a region name
-   * using admin protocol.
+   * A helper to retrieve region info given a region name or an
+   * encoded region name using admin protocol.
    *
-   * @param admin
-   * @param regionName
    * @return the retrieved region info
-   * @throws IOException
    */
-  public static org.apache.hadoop.hbase.client.RegionInfo getRegionInfo(final RpcController controller,
-      final AdminService.BlockingInterface admin, final byte[] regionName) throws IOException {
+  public static org.apache.hadoop.hbase.client.RegionInfo getRegionInfo(
+      final RpcController controller, final AdminService.BlockingInterface admin,
+      final byte[] regionName) throws IOException {
     try {
-      GetRegionInfoRequest request =
-        RequestConverter.buildGetRegionInfoRequest(regionName);
-      GetRegionInfoResponse response =
-        admin.getRegionInfo(controller, request);
+      GetRegionInfoRequest request = getGetRegionInfoRequest(regionName);
+      GetRegionInfoResponse response = admin.getRegionInfo(controller,
+        getGetRegionInfoRequest(regionName));
       return toRegionInfo(response.getRegionInfo());
     } catch (ServiceException se) {
       throw getRemoteException(se);
     }
   }
 
-  public static List<org.apache.hadoop.hbase.RegionLoad> getRegionLoadInfo(
-      GetRegionLoadResponse regionLoadResponse) {
-    List<org.apache.hadoop.hbase.RegionLoad> regionLoadList =
-        new ArrayList<>(regionLoadResponse.getRegionLoadsCount());
-    for (RegionLoad regionLoad : regionLoadResponse.getRegionLoadsList()) {
-      regionLoadList.add(new org.apache.hadoop.hbase.RegionLoad(regionLoad));
-    }
-    return regionLoadList;
+  /**
+   * @return A GetRegionInfoRequest for the passed in regionName.
+   */
+  public static GetRegionInfoRequest getGetRegionInfoRequest(final byte [] regionName)
+    throws IOException {
+    return org.apache.hadoop.hbase.client.RegionInfo.isEncodedRegionName(regionName)?
+        GetRegionInfoRequest.newBuilder().setRegion(RequestConverter.
+          buildRegionSpecifier(RegionSpecifierType.ENCODED_REGION_NAME, regionName)).build():
+        RequestConverter.buildGetRegionInfoRequest(regionName);
   }
 
   /**
@@ -1975,14 +1978,13 @@ public final class ProtobufUtil {
   }
 
   /**
-   * Unwraps an exception from a protobuf service into the underlying (expected) IOException.
-   * This method will <strong>always</strong> throw an exception.
+   * Unwraps an exception from a protobuf service into the underlying (expected) IOException. This
+   * method will <strong>always</strong> throw an exception.
    * @param se the {@code ServiceException} instance to convert into an {@code IOException}
+   * @throws NullPointerException if {@code se} is {@code null}
    */
   public static void toIOException(ServiceException se) throws IOException {
-    if (se == null) {
-      throw new NullPointerException("Null service exception passed!");
-    }
+    Objects.requireNonNull(se, "Service exception cannot be null");
 
     Throwable cause = se.getCause();
     if (cause != null && cause instanceof IOException) {
@@ -2234,6 +2236,14 @@ public final class ProtobufUtil {
     return HBaseProtos.TableName.newBuilder()
         .setNamespace(UnsafeByteOperations.unsafeWrap(tableName.getNamespace()))
         .setQualifier(UnsafeByteOperations.unsafeWrap(tableName.getQualifier())).build();
+  }
+
+  public static HBaseProtos.RegionInfo toProtoRegionInfo(
+    org.apache.hadoop.hbase.client.RegionInfo regionInfo) {
+    return HBaseProtos.RegionInfo.newBuilder()
+      .setRegionId(regionInfo.getRegionId())
+      .setRegionEncodedName(regionInfo.getEncodedName())
+      .setTableName(toProtoTableName(regionInfo.getTable())).build();
   }
 
   public static List<TableName> toTableNameList(List<HBaseProtos.TableName> tableNamesList) {
@@ -2577,12 +2587,25 @@ public final class ProtobufUtil {
    * @return The WAL log marker for bulk loads.
    */
   public static WALProtos.BulkLoadDescriptor toBulkLoadDescriptor(TableName tableName,
+    ByteString encodedRegionName, Map<byte[], List<Path>> storeFiles,
+    Map<String, Long> storeFilesSize, long bulkloadSeqId) {
+    return toBulkLoadDescriptor(tableName, encodedRegionName, storeFiles,
+      storeFilesSize, bulkloadSeqId, null, true);
+  }
+
+  public static WALProtos.BulkLoadDescriptor toBulkLoadDescriptor(TableName tableName,
       ByteString encodedRegionName, Map<byte[], List<Path>> storeFiles,
-      Map<String, Long> storeFilesSize, long bulkloadSeqId) {
+      Map<String, Long> storeFilesSize, long bulkloadSeqId,
+      List<String> clusterIds, boolean replicate) {
     BulkLoadDescriptor.Builder desc =
         BulkLoadDescriptor.newBuilder()
-        .setTableName(ProtobufUtil.toProtoTableName(tableName))
-        .setEncodedRegionName(encodedRegionName).setBulkloadSeqNum(bulkloadSeqId);
+          .setTableName(ProtobufUtil.toProtoTableName(tableName))
+          .setEncodedRegionName(encodedRegionName)
+          .setBulkloadSeqNum(bulkloadSeqId)
+          .setReplicate(replicate);
+    if(clusterIds != null) {
+      desc.addAllClusterIds(clusterIds);
+    }
 
     for (Map.Entry<byte[], List<Path>> entry : storeFiles.entrySet()) {
       WALProtos.StoreDescriptor.Builder builder = StoreDescriptor.newBuilder()
@@ -3049,6 +3072,44 @@ public final class ProtobufUtil {
   }
 
   /**
+   * Get the Meta region state from the passed data bytes. Can handle both old and new style
+   * server names.
+   * @param data protobuf serialized data with meta server name.
+   * @param replicaId replica ID for this region
+   * @return RegionState instance corresponding to the serialized data.
+   * @throws DeserializationException if the data is invalid.
+   */
+  public static RegionState parseMetaRegionStateFrom(final byte[] data, int replicaId)
+      throws DeserializationException {
+    RegionState.State state = RegionState.State.OPEN;
+    ServerName serverName;
+    if (data != null && data.length > 0 && ProtobufUtil.isPBMagicPrefix(data)) {
+      try {
+        int prefixLen = ProtobufUtil.lengthOfPBMagic();
+        ZooKeeperProtos.MetaRegionServer rl =
+            ZooKeeperProtos.MetaRegionServer.parser().parseFrom(data, prefixLen,
+                data.length - prefixLen);
+        if (rl.hasState()) {
+          state = RegionState.State.convert(rl.getState());
+        }
+        HBaseProtos.ServerName sn = rl.getServer();
+        serverName = ServerName.valueOf(
+            sn.getHostName(), sn.getPort(), sn.getStartCode());
+      } catch (InvalidProtocolBufferException e) {
+        throw new DeserializationException("Unable to parse meta region location");
+      }
+    } else {
+      // old style of meta region location?
+      serverName = parseServerNameFrom(data);
+    }
+    if (serverName == null) {
+      state = RegionState.State.OFFLINE;
+    }
+    return new RegionState(RegionReplicaUtil.getRegionInfoForReplica(
+        RegionInfoBuilder.FIRST_META_REGIONINFO, replicaId), state, serverName);
+  }
+
+  /**
    * Get a ServerName from the passed in data bytes.
    * @param data Data with a serialize server name in it; can handle the old style
    * servername where servername was host and port.  Works too with data that
@@ -3142,6 +3203,7 @@ public final class ProtobufUtil {
     builder.setOffline(info.isOffline());
     builder.setSplit(info.isSplit());
     builder.setReplicaId(info.getReplicaId());
+    builder.setRegionEncodedName(info.getEncodedName());
     return builder.build();
   }
 
@@ -3180,6 +3242,9 @@ public final class ProtobufUtil {
     .setSplit(split);
     if (proto.hasOffline()) {
       rib.setOffline(proto.getOffline());
+    }
+    if (proto.hasRegionEncodedName()) {
+      rib.setEncodedName(proto.getRegionEncodedName());
     }
     return rib.build();
   }
@@ -3298,4 +3363,51 @@ public final class ProtobufUtil {
     }
     return Collections.emptySet();
   }
+
+  public static ClusterStatusProtos.RegionStatesCount toTableRegionStatesCount(
+      RegionStatesCount regionStatesCount) {
+    int openRegions = 0;
+    int splitRegions = 0;
+    int closedRegions = 0;
+    int regionsInTransition = 0;
+    int totalRegions = 0;
+    if (regionStatesCount != null) {
+      openRegions = regionStatesCount.getOpenRegions();
+      splitRegions = regionStatesCount.getSplitRegions();
+      closedRegions = regionStatesCount.getClosedRegions();
+      regionsInTransition = regionStatesCount.getRegionsInTransition();
+      totalRegions = regionStatesCount.getTotalRegions();
+    }
+    return ClusterStatusProtos.RegionStatesCount.newBuilder()
+      .setOpenRegions(openRegions)
+      .setSplitRegions(splitRegions)
+      .setClosedRegions(closedRegions)
+      .setRegionsInTransition(regionsInTransition)
+      .setTotalRegions(totalRegions)
+      .build();
+  }
+
+  public static RegionStatesCount toTableRegionStatesCount(
+    ClusterStatusProtos.RegionStatesCount regionStatesCount) {
+    int openRegions = 0;
+    int splitRegions = 0;
+    int closedRegions = 0;
+    int regionsInTransition = 0;
+    int totalRegions = 0;
+    if (regionStatesCount != null) {
+      closedRegions = regionStatesCount.getClosedRegions();
+      regionsInTransition = regionStatesCount.getRegionsInTransition();
+      openRegions = regionStatesCount.getOpenRegions();
+      splitRegions = regionStatesCount.getSplitRegions();
+      totalRegions = regionStatesCount.getTotalRegions();
+    }
+    return new RegionStatesCount.RegionStatesCountBuilder()
+      .setOpenRegions(openRegions)
+      .setSplitRegions(splitRegions)
+      .setClosedRegions(closedRegions)
+      .setRegionsInTransition(regionsInTransition)
+      .setTotalRegions(totalRegions)
+      .build();
+  }
+
 }

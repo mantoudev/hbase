@@ -185,7 +185,8 @@ public final class SnapshotManifest {
   @VisibleForTesting
   protected void addMobRegion(RegionInfo regionInfo, RegionVisitor visitor) throws IOException {
     // 1. dump region meta info into the snapshot directory
-    LOG.debug("Storing mob region '" + regionInfo + "' region-info for snapshot.");
+    final String snapshotName = desc.getName();
+    LOG.debug("Storing mob region '" + regionInfo + "' region-info for snapshot=" + snapshotName);
     Object regionData = visitor.regionOpen(regionInfo);
     monitor.rethrowException();
 
@@ -232,7 +233,8 @@ public final class SnapshotManifest {
   @VisibleForTesting
   protected void addRegion(final HRegion region, RegionVisitor visitor) throws IOException {
     // 1. dump region meta info into the snapshot directory
-    LOG.debug("Storing '" + region + "' region-info for snapshot.");
+    final String snapshotName = desc.getName();
+    LOG.debug("Storing '" + region + "' region-info for snapshot=" + snapshotName);
     Object regionData = visitor.regionOpen(region.getRegionInfo());
     monitor.rethrowException();
 
@@ -256,7 +258,8 @@ public final class SnapshotManifest {
         monitor.rethrowException();
 
         // create "reference" to this store file.
-        LOG.debug("Adding reference for file (" + (i+1) + "/" + sz + "): " + storeFile.getPath());
+        LOG.debug("Adding reference for file (" + (i+1) + "/" + sz + "): " + storeFile.getPath() +
+                " for snapshot=" + snapshotName);
         visitor.storeFile(regionData, familyData, storeFile.getFileInfo());
       }
       visitor.familyClose(regionData, familyData);
@@ -469,11 +472,10 @@ public final class SnapshotManifest {
 
   public void consolidate() throws IOException {
     if (getSnapshotFormat(desc) == SnapshotManifestV1.DESCRIPTOR_VERSION) {
-      Path rootDir = FSUtils.getRootDir(conf);
       LOG.info("Using old Snapshot Format");
       // write a copy of descriptor to the snapshot directory
-      new FSTableDescriptors(conf, workingDirFs, rootDir)
-        .createTableDescriptorForTableDirectory(workingDir, htd, false);
+      FSTableDescriptors.createTableDescriptorForTableDirectory(workingDirFs, workingDir, htd,
+          false);
     } else {
       LOG.debug("Convert to Single Snapshot Manifest");
       convertToV2SingleManifest();
@@ -571,7 +573,7 @@ public final class SnapshotManifest {
   public static ThreadPoolExecutor createExecutor(final Configuration conf, final String name) {
     int maxThreads = conf.getInt("hbase.snapshot.thread.pool.max", 8);
     return Threads.getBoundedCachedThreadPool(maxThreads, 30L, TimeUnit.SECONDS,
-              Threads.getNamedThreadFactory(name));
+              Threads.newDaemonThreadFactory(name));
   }
 
   /**

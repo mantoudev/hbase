@@ -74,7 +74,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos;
  */
 @Deprecated
 @InterfaceAudience.Public
-public class HRegionInfo implements RegionInfo, Comparable<HRegionInfo> {
+public class HRegionInfo implements RegionInfo {
   private static final Logger LOG = LoggerFactory.getLogger(HRegionInfo.class);
 
   /**
@@ -456,8 +456,7 @@ public class HRegionInfo implements RegionInfo, Comparable<HRegionInfo> {
    */
   @Deprecated
   @InterfaceAudience.Private
-  public static byte [][] parseRegionName(final byte [] regionName)
-  throws IOException {
+  public static byte [][] parseRegionName(final byte [] regionName) throws IOException {
     return RegionInfo.parseRegionName(regionName);
   }
 
@@ -700,15 +699,6 @@ public class HRegionInfo implements RegionInfo, Comparable<HRegionInfo> {
   @Override
   public int hashCode() {
     return this.hashCode;
-  }
-
-  //
-  // Comparable
-  //
-
-  @Override
-  public int compareTo(HRegionInfo o) {
-    return RegionInfo.COMPARATOR.compare(this, o);
   }
 
   /**

@@ -18,10 +18,12 @@
 pipeline {
 
     agent {
-        label 'Hadoop || ubuntu'
+        label 'Hadoop'
     }
 
     options {
+        // N.B. this is per-branch, which means per PR
+        disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '15'))
         timeout (time: 7, unit: 'HOURS')
         timestamps()
@@ -35,7 +37,7 @@ pipeline {
         DOCKERFILE = "${SOURCEDIR}/dev-support/docker/Dockerfile"
         YETUS='yetus'
         // Branch or tag name.  Yetus release tags are 'rel/X.Y.Z'
-        YETUS_VERSION='rel/0.10.0'
+        YETUS_VERSION='rel/0.11.1'
     }
 
     parameters {
@@ -63,7 +65,7 @@ pipeline {
                     [usernamePassword(credentialsId: 'apache-hbase-at-github.com',
                                   passwordVariable: 'GITHUB_PASSWORD',
                                   usernameVariable: 'GITHUB_USER'),
-                    usernamePassword(credentialsId: 'hadoopqa-at-asf-jira',
+                    usernamePassword(credentialsId: 'hbaseqa-at-asf-jira',
                                         passwordVariable: 'JIRA_PASSWORD',
                                         usernameVariable: 'JIRA_USER')]) {
                         sh '''#!/usr/bin/env bash
@@ -81,19 +83,8 @@ pipeline {
                         echo "MAVEN_HOME: ${MAVEN_HOME}"
                         echo "maven version:"
                         mvn --offline --version  || true
-                        echo "getting machine specs, find in ${BUILD_URL}/artifact/patchprocess/machine/"
                         mkdir "${PATCHDIR}/machine"
-                        cat /proc/cpuinfo >"${PATCHDIR}/machine/cpuinfo" 2>&1 || true
-                        cat /proc/meminfo >"${PATCHDIR}/machine/meminfo" 2>&1 || true
-                        cat /proc/diskstats >"${PATCHDIR}/machine/diskstats" 2>&1 || true
-                        cat /sys/block/sda/stat >"${PATCHDIR}/machine/sys-block-sda-stat" 2>&1 || true
-                        df -h >"${PATCHDIR}/machine/df-h" 2>&1 || true
-                        ps -Awwf >"${PATCHDIR}/machine/ps-Awwf" 2>&1 || true
-                        ifconfig -a >"${PATCHDIR}/machine/ifconfig-a" 2>&1 || true
-                        lsblk -ta >"${PATCHDIR}/machine/lsblk-ta" 2>&1 || true
-                        lsblk -fa >"${PATCHDIR}/machine/lsblk-fa" 2>&1 || true
-                        cat /proc/loadavg >"${output}/loadavg" 2>&1 || true
-                        ulimit -a >"${PATCHDIR}/machine/ulimit-a" 2>&1 || true
+                       "${SOURCEDIR}/dev-support/gather_machine_environment.sh" "${PATCHDIR}/machine"
                         ## /H*
 
                         # If CHANGE_URL is set (e.g., Github Branch Source plugin), process it.
@@ -107,6 +98,10 @@ pipeline {
                         # enable debug output for yetus
                         if [[ "true" = "${DEBUG}" ]]; then
                             YETUS_ARGS+=("--debug")
+                        fi
+                        # If we're doing docker, make sure we don't accidentally pollute the image with a host java path
+                        if [ -n "${JAVA_HOME}" ]; then
+                          unset JAVA_HOME
                         fi
                         YETUS_ARGS+=("--patch-dir=${WORKSPACE}/${PATCHDIR}")
                         # where the source is located
@@ -149,7 +144,6 @@ pipeline {
                         YETUS_ARGS+=("--docker")
                         YETUS_ARGS+=("--dockerfile=${DOCKERFILE}")
                         YETUS_ARGS+=("--mvn-custom-repos")
-                        YETUS_ARGS+=("--jenkins")
                         YETUS_ARGS+=("--multijdkdirs=/usr/lib/jvm/java-8-openjdk-amd64")
                         YETUS_ARGS+=("--findbugs-home=/usr")
                         YETUS_ARGS+=("--whitespace-eol-ignore-list=.*/generated/.*")
@@ -158,9 +152,11 @@ pipeline {
                         YETUS_ARGS+=("--quick-hadoopcheck")
                         YETUS_ARGS+=("--skip-errorprone")
                         # effectively treat dev-support as a custom maven module
-                        YETUS_ARGS+=("--skip-dir=dev-support")
+                        YETUS_ARGS+=("--skip-dirs=dev-support")
                         # help keep the ASF boxes clean
                         YETUS_ARGS+=("--sentinel")
+                        # use emoji vote so it is easier to find the broken line
+                        YETUS_ARGS+=("--github-use-emoji-vote")
                         "${TESTPATCHBIN}" "${YETUS_ARGS[@]}"
                         '''
                 }

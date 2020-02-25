@@ -168,7 +168,7 @@ public class TestThriftConnection {
     httpPort = HBaseTestingUtility.randomFreePort();
     // Start a thrift server
     thriftServer = startThriftServer(thriftPort, false);
-    // Start a HTTP thrift server
+    // Start an HTTP thrift server
     thriftHttpServer = startThriftServer(httpPort, true);
     thriftConnection = createConnection(thriftPort, false);
     thriftHttpConnection = createConnection(httpPort, true);
@@ -196,10 +196,19 @@ public class TestThriftConnection {
   }
 
   @Test
-  public void testThrfitAdmin() throws Exception {
-    testThriftAdmin(thriftConnection, "testThrfitAdminNamesapce", "testThrfitAdminTable");
-    testThriftAdmin(thriftHttpConnection, "testThrfitHttpAdminNamesapce",
-        "testThrfitHttpAdminTable");
+  public void testGetClusterId() {
+    String actualClusterId = TEST_UTIL.getMiniHBaseCluster().getMaster().getClusterId();
+    for (Connection conn: new Connection[] {thriftConnection, thriftHttpConnection}) {
+      String thriftClusterId = conn.getClusterId();
+      assertEquals(actualClusterId, thriftClusterId);
+    }
+  }
+
+  @Test
+  public void testThriftAdmin() throws Exception {
+    testThriftAdmin(thriftConnection, "testThriftAdminNamespace", "testThriftAdminTable");
+    testThriftAdmin(thriftHttpConnection, "testThriftHttpAdminNamespace",
+        "testThriftHttpAdminTable");
   }
 
   @Test
@@ -209,7 +218,7 @@ public class TestThriftConnection {
 
   }
 
-  public void testGet(Connection connection, String tableName) throws IOException {
+  private void testGet(Connection connection, String tableName) throws IOException {
     createTable(thriftAdmin, tableName);
     try (Table table = connection.getTable(TableName.valueOf(tableName))){
       Get get = new Get(ROW_1);

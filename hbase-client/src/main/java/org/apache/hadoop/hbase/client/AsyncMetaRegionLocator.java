@@ -23,7 +23,6 @@ import static org.apache.hadoop.hbase.client.AsyncRegionLocatorHelper.isGood;
 import static org.apache.hadoop.hbase.client.AsyncRegionLocatorHelper.removeRegionLocation;
 import static org.apache.hadoop.hbase.client.AsyncRegionLocatorHelper.replaceRegionLocation;
 
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hadoop.hbase.HRegionLocation;
@@ -39,14 +38,14 @@ import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesti
 @InterfaceAudience.Private
 class AsyncMetaRegionLocator {
 
-  private final AsyncRegistry registry;
+  private final ConnectionRegistry registry;
 
   private final AtomicReference<RegionLocations> metaRegionLocations = new AtomicReference<>();
 
   private final AtomicReference<CompletableFuture<RegionLocations>> metaRelocateFuture =
     new AtomicReference<>();
 
-  AsyncMetaRegionLocator(AsyncRegistry registry) {
+  AsyncMetaRegionLocator(ConnectionRegistry registry) {
     this.registry = registry;
   }
 
@@ -61,7 +60,7 @@ class AsyncMetaRegionLocator {
    */
   CompletableFuture<RegionLocations> getRegionLocations(int replicaId, boolean reload) {
     return ConnectionUtils.getOrFetch(metaRegionLocations, metaRelocateFuture, reload,
-      registry::getMetaRegionLocation, locs -> isGood(locs, replicaId), "meta region location");
+      registry::getMetaRegionLocations, locs -> isGood(locs, replicaId), "meta region location");
   }
 
   private HRegionLocation getCacheLocation(HRegionLocation loc) {
@@ -110,7 +109,7 @@ class AsyncMetaRegionLocator {
 
   void updateCachedLocationOnError(HRegionLocation loc, Throwable exception) {
     AsyncRegionLocatorHelper.updateCachedLocationOnError(loc, exception, this::getCacheLocation,
-      this::addLocationToCache, this::removeLocationFromCache, Optional.empty());
+      this::addLocationToCache, this::removeLocationFromCache, null);
   }
 
   void clearCache() {

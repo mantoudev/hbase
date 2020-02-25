@@ -19,7 +19,6 @@ package org.apache.hadoop.hbase.regionserver;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -31,7 +30,6 @@ import java.util.Map;
 import java.util.OptionalLong;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicInteger;
-
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -51,6 +49,7 @@ import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
 import org.apache.hadoop.hbase.io.HFileLink;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 import org.apache.hadoop.hbase.io.hfile.BlockCache;
@@ -61,9 +60,12 @@ import org.apache.hadoop.hbase.io.hfile.HFileContext;
 import org.apache.hadoop.hbase.io.hfile.HFileContextBuilder;
 import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoder;
 import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoderImpl;
+import org.apache.hadoop.hbase.io.hfile.HFileInfo;
 import org.apache.hadoop.hbase.io.hfile.HFileScanner;
+import org.apache.hadoop.hbase.io.hfile.ReaderContext;
+import org.apache.hadoop.hbase.io.hfile.ReaderContextBuilder;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.testclassification.RegionServerTests;
-import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.BloomFilterFactory;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ChecksumType;
@@ -83,7 +85,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Test HStoreFile
  */
-@Category({RegionServerTests.class, SmallTests.class})
+@Category({RegionServerTests.class, MediumTests.class})
 public class TestHStoreFile extends HBaseTestCase {
 
   @ClassRule
@@ -113,7 +115,6 @@ public class TestHStoreFile extends HBaseTestCase {
   /**
    * Write a file and then assert that we can read from top and bottom halves
    * using two HalfMapFiles.
-   * @throws Exception
    */
   @Test
   public void testBasicHalfMapFile() throws Exception {
@@ -148,7 +149,7 @@ public class TestHStoreFile extends HBaseTestCase {
    * @throws IOException
    */
   public static void writeStoreFile(final StoreFileWriter writer, byte[] fam, byte[] qualifier)
-  throws IOException {
+      throws IOException {
     long now = System.currentTimeMillis();
     try {
       for (char d = FIRST_CHAR; d <= LAST_CHAR; d++) {
@@ -165,7 +166,6 @@ public class TestHStoreFile extends HBaseTestCase {
   /**
    * Test that our mechanism of writing store files in one region to reference
    * store files in other regions works.
-   * @throws IOException
    */
   @Test
   public void testReference() throws IOException {
@@ -281,9 +281,8 @@ public class TestHStoreFile extends HBaseTestCase {
                   HFileLink.createHFileLinkName(hri, storeFilePath.getName()));
 
     // Try to open store file from link
-    StoreFileInfo storeFileInfo = new StoreFileInfo(testConf, this.fs, linkFilePath);
-    HStoreFile hsf =
-        new HStoreFile(this.fs, storeFileInfo, testConf, cacheConf, BloomType.NONE, true);
+    StoreFileInfo storeFileInfo = new StoreFileInfo(testConf, this.fs, linkFilePath, true);
+    HStoreFile hsf = new HStoreFile(storeFileInfo, BloomType.NONE, cacheConf);
     assertTrue(storeFileInfo.isLink());
     hsf.initReader();
 
@@ -385,8 +384,7 @@ public class TestHStoreFile extends HBaseTestCase {
     KeyValue midKV = (KeyValue)midkey;
     byte [] midRow = CellUtil.cloneRow(midKV);
     // Create top split.
-    HRegionInfo topHri = new HRegionInfo(regionFs.getRegionInfo().getTable(),
-        null, midRow);
+    HRegionInfo topHri = new HRegionInfo(regionFs.getRegionInfo().getTable(), null, midRow);
     Path topPath = splitStoreFile(regionFs, topHri, TEST_FAMILY, f, midRow, true);
     // Create bottom split.
     HRegionInfo bottomHri = new HRegionInfo(regionFs.getRegionInfo().getTable(),
@@ -550,8 +548,11 @@ public class TestHStoreFile extends HBaseTestCase {
     }
     writer.close();
 
+    ReaderContext context = new ReaderContextBuilder().withFileSystemAndPath(fs, f).build();
+    HFileInfo fileInfo = new HFileInfo(context, conf);
     StoreFileReader reader =
-        new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+        new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+    fileInfo.initMetaAndIndex(reader.getHFileReader());
     reader.loadFileInfo();
     reader.loadBloomfilter();
     StoreFileScanner scanner = getStoreFileScanner(reader, false, false);
@@ -571,9 +572,13 @@ public class TestHStoreFile extends HBaseTestCase {
           .thenReturn(ColumnFamilyDescriptorBuilder.of("family"));
       boolean exists = scanner.shouldUseScanner(scan, store, Long.MIN_VALUE);
       if (i % 2 == 0) {
-        if (!exists) falseNeg++;
+        if (!exists) {
+          falseNeg++;
+        }
       } else {
-        if (exists) falsePos++;
+        if (exists) {
+          falsePos++;
+        }
       }
     }
     reader.close(true); // evict because we are about to delete the file
@@ -638,8 +643,11 @@ public class TestHStoreFile extends HBaseTestCase {
     }
     writer.close();
 
+    ReaderContext context = new ReaderContextBuilder().withFileSystemAndPath(fs, f).build();
+    HFileInfo fileInfo = new HFileInfo(context, conf);
     StoreFileReader reader =
-        new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+        new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+    fileInfo.initMetaAndIndex(reader.getHFileReader());
     reader.loadFileInfo();
     reader.loadBloomfilter();
 
@@ -651,11 +659,13 @@ public class TestHStoreFile extends HBaseTestCase {
       byte[] rowKey = Bytes.toBytes(row);
       boolean exists = reader.passesDeleteFamilyBloomFilter(rowKey, 0, rowKey.length);
       if (i % 2 == 0) {
-        if (!exists)
+        if (!exists) {
           falseNeg++;
+        }
       } else {
-        if (exists)
+        if (exists) {
           falsePos++;
+        }
       }
     }
     assertEquals(1000, reader.getDeleteFamilyCnt());
@@ -684,8 +694,11 @@ public class TestHStoreFile extends HBaseTestCase {
     writeStoreFile(writer);
     writer.close();
 
+    ReaderContext context = new ReaderContextBuilder().withFileSystemAndPath(fs, f).build();
+    HFileInfo fileInfo = new HFileInfo(context, conf);
     StoreFileReader reader =
-        new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+        new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+    fileInfo.initMetaAndIndex(reader.getHFileReader());
 
     // Now do reseek with empty KV to position to the beginning of the file
 
@@ -744,8 +757,16 @@ public class TestHStoreFile extends HBaseTestCase {
       }
       writer.close();
 
+      ReaderContext context = new ReaderContextBuilder()
+          .withFilePath(f)
+          .withFileSize(fs.getFileStatus(f).getLen())
+          .withFileSystem(fs)
+          .withInputStreamWrapper(new FSDataInputStreamWrapper(fs, f))
+          .build();
+      HFileInfo fileInfo = new HFileInfo(context, conf);
       StoreFileReader reader =
-          new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+          new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+      fileInfo.initMetaAndIndex(reader.getHFileReader());
       reader.loadFileInfo();
       reader.loadBloomfilter();
       StoreFileScanner scanner = getStoreFileScanner(reader, false, false);
@@ -773,9 +794,13 @@ public class TestHStoreFile extends HBaseTestCase {
           boolean shouldColExist = j % 2 == 0;
           shouldColExist = shouldColExist || bt[x] == BloomType.ROW;
           if (shouldRowExist && shouldColExist) {
-            if (!exists) falseNeg++;
+            if (!exists) {
+              falseNeg++;
+            }
           } else {
-            if (exists) falsePos++;
+            if (exists) {
+              falsePos++;
+            }
           }
         }
       }
@@ -840,10 +865,6 @@ public class TestHStoreFile extends HBaseTestCase {
 
   /**
    * Generate a list of KeyValues for testing based on given parameters
-   * @param timestamps
-   * @param numRows
-   * @param qualifier
-   * @param family
    * @return the rows key-value list
    */
   List<KeyValue> getKeyValueSet(long[] timestamps, int numRows,
@@ -853,8 +874,7 @@ public class TestHStoreFile extends HBaseTestCase {
       byte[] b = Bytes.toBytes(i) ;
       LOG.info(Bytes.toString(b));
       LOG.info(Bytes.toString(b));
-      for (long timestamp: timestamps)
-      {
+      for (long timestamp: timestamps) {
         kvList.add(new KeyValue(b, family, qualifier, timestamp, b));
       }
     }
@@ -863,7 +883,6 @@ public class TestHStoreFile extends HBaseTestCase {
 
   /**
    * Test to ensure correctness when using StoreFile with multiple timestamps
-   * @throws IOException
    */
   @Test
   public void testMultipleTimestamps() throws IOException {
@@ -957,7 +976,9 @@ public class TestHStoreFile extends HBaseTestCase {
     reader.loadFileInfo();
     StoreFileScanner scanner = getStoreFileScanner(reader, true, true);
     scanner.seek(KeyValue.LOWESTKEY);
-    while (scanner.next() != null);
+    while (scanner.next() != null) {
+      continue;
+    }
     assertEquals(startHit, cs.getHitCount());
     assertEquals(startMiss + 3, cs.getMissCount());
     assertEquals(startEvicted, cs.getEvictedCount());
@@ -978,7 +999,9 @@ public class TestHStoreFile extends HBaseTestCase {
     reader = hsf.getReader();
     scanner = getStoreFileScanner(reader, true, true);
     scanner.seek(KeyValue.LOWESTKEY);
-    while (scanner.next() != null);
+    while (scanner.next() != null) {
+      continue;
+    }
     assertEquals(startHit + 3, cs.getHitCount());
     assertEquals(startMiss, cs.getMissCount());
     assertEquals(startEvicted, cs.getEvictedCount());
@@ -1063,9 +1086,8 @@ public class TestHStoreFile extends HBaseTestCase {
     return new Path(new Path(regionDir, family), path.getName());
   }
 
-  private StoreFileWriter writeStoreFile(Configuration conf,
-      CacheConfig cacheConf, Path path, int numBlocks)
-  throws IOException {
+  private StoreFileWriter writeStoreFile(Configuration conf, CacheConfig cacheConf, Path path,
+      int numBlocks) throws IOException {
     // Let's put ~5 small KVs in each block, so let's make 5*numBlocks KVs
     int numKVs = 5 * numBlocks;
     List<KeyValue> kvs = new ArrayList<>(numKVs);

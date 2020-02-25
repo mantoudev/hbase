@@ -72,7 +72,9 @@ import org.apache.hadoop.hbase.protobuf.ProtobufMagic;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.HasThread;
 import org.apache.hadoop.hbase.util.IdReadWriteLock;
-import org.apache.hadoop.hbase.util.IdReadWriteLock.ReferenceType;
+import org.apache.hadoop.hbase.util.IdReadWriteLockStrongRef;
+import org.apache.hadoop.hbase.util.IdReadWriteLockWithObjectPool;
+import org.apache.hadoop.hbase.util.IdReadWriteLockWithObjectPool.ReferenceType;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
@@ -112,6 +114,10 @@ public class BucketCache implements BlockCache, HeapSize {
   static final String EXTRA_FREE_FACTOR_CONFIG_NAME = "hbase.bucketcache.extrafreefactor";
   static final String ACCEPT_FACTOR_CONFIG_NAME = "hbase.bucketcache.acceptfactor";
   static final String MIN_FACTOR_CONFIG_NAME = "hbase.bucketcache.minfactor";
+
+  /** Use strong reference for offsetLock or not */
+  private static final String STRONG_REF_KEY = "hbase.bucketcache.offsetlock.usestrongref";
+  private static final boolean STRONG_REF_DEFAULT = false;
 
   /** Priority buckets */
   @VisibleForTesting
@@ -199,10 +205,9 @@ public class BucketCache implements BlockCache, HeapSize {
    * A ReentrantReadWriteLock to lock on a particular block identified by offset.
    * The purpose of this is to avoid freeing the block which is being read.
    * <p>
-   * Key set of offsets in BucketCache is limited so soft reference is the best choice here.
    */
   @VisibleForTesting
-  transient final IdReadWriteLock<Long> offsetLock = new IdReadWriteLock<>(ReferenceType.SOFT);
+  transient final IdReadWriteLock<Long> offsetLock;
 
   private final NavigableSet<BlockCacheKey> blocksByHFile = new ConcurrentSkipListSet<>((a, b) -> {
     int nameComparison = a.getHfileName().compareTo(b.getHfileName());
@@ -238,6 +243,16 @@ public class BucketCache implements BlockCache, HeapSize {
   /** In-memory bucket size */
   private float memoryFactor;
 
+  private static final String FILE_VERIFY_ALGORITHM =
+    "hbase.bucketcache.persistent.file.integrity.check.algorithm";
+  private static final String DEFAULT_FILE_VERIFY_ALGORITHM = "MD5";
+
+  /**
+   * Use {@link java.security.MessageDigest} class's encryption algorithms to check
+   * persistent file integrity, default algorithm is MD5
+   * */
+  private String algorithm;
+
   public BucketCache(String ioEngineName, long capacity, int blockSize, int[] bucketSizes,
       int writerThreadNum, int writerQLen, String persistencePath) throws IOException {
     this(ioEngineName, capacity, blockSize, bucketSizes, writerThreadNum, writerQLen,
@@ -247,6 +262,13 @@ public class BucketCache implements BlockCache, HeapSize {
   public BucketCache(String ioEngineName, long capacity, int blockSize, int[] bucketSizes,
       int writerThreadNum, int writerQLen, String persistencePath, int ioErrorsTolerationDuration,
       Configuration conf) throws IOException {
+    boolean useStrongRef = conf.getBoolean(STRONG_REF_KEY, STRONG_REF_DEFAULT);
+    if (useStrongRef) {
+      this.offsetLock = new IdReadWriteLockStrongRef<>();
+    } else {
+      this.offsetLock = new IdReadWriteLockWithObjectPool<>(ReferenceType.SOFT);
+    }
+    this.algorithm = conf.get(FILE_VERIFY_ALGORITHM, DEFAULT_FILE_VERIFY_ALGORITHM);
     this.ioEngine = getIOEngineFromName(ioEngineName, capacity, persistencePath);
     this.writerThreads = new WriterThread[writerThreadNum];
     long blockNumCapacity = capacity / blockSize;
@@ -266,7 +288,7 @@ public class BucketCache implements BlockCache, HeapSize {
 
     LOG.info("Instantiating BucketCache with acceptableFactor: " + acceptableFactor + ", minFactor: " + minFactor +
         ", extraFreeFactor: " + extraFreeFactor + ", singleFactor: " + singleFactor + ", multiFactor: " + multiFactor +
-        ", memoryFactor: " + memoryFactor);
+        ", memoryFactor: " + memoryFactor + ", useStrongRef: " + useStrongRef);
 
     this.cacheCapacity = capacity;
     this.persistencePath = persistencePath;
@@ -502,8 +524,11 @@ public class BucketCache implements BlockCache, HeapSize {
           // block will use the refCnt of bucketEntry, which means if two HFileBlock mapping to
           // the same BucketEntry, then all of the three will share the same refCnt.
           Cacheable cachedBlock = ioEngine.read(bucketEntry);
-          // RPC start to reference, so retain here.
-          cachedBlock.retain();
+          if (ioEngine.usesSharedMemory()) {
+            // If IOEngine use shared memory, cachedBlock and BucketEntry will share the
+            // same RefCnt, do retain here, in order to count the number of RPC references
+            cachedBlock.retain();
+          }
           // Update the cache statistics.
           if (updateCacheMetrics) {
             cacheStats.hit(caching, key.isPrimary(), key.getBlockType());
@@ -1080,6 +1105,7 @@ public class BucketCache implements BlockCache, HeapSize {
       }
       parsePB(BucketCacheProtos.BucketCacheEntry.parseDelimitedFrom(in));
       bucketAllocator = new BucketAllocator(cacheCapacity, bucketSizes, backingMap, realCacheSize);
+      blockNumber.add(backingMap.size());
     }
   }
 
@@ -1128,6 +1154,13 @@ public class BucketCache implements BlockCache, HeapSize {
   }
 
   private void parsePB(BucketCacheProtos.BucketCacheEntry proto) throws IOException {
+    if (proto.hasChecksum()) {
+      ((PersistentIOEngine) ioEngine).verifyFileIntegrity(proto.getChecksum().toByteArray(),
+        algorithm);
+    } else {
+      // if has not checksum, it means the persistence file is old format
+      LOG.info("Persistent file is old format, it does not support verifying file integrity!");
+    }
     verifyCapacityAndClasses(proto.getCacheCapacity(), proto.getIoClass(), proto.getMapClass());
     backingMap = BucketProtoUtils.fromPB(proto.getDeserializersMap(), proto.getBackingMap());
   }
@@ -1230,6 +1263,10 @@ public class BucketCache implements BlockCache, HeapSize {
   @Override
   public long getCurrentSize() {
     return this.bucketAllocator.getUsedSize();
+  }
+
+  protected String getAlgorithm() {
+    return algorithm;
   }
 
   /**

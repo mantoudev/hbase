@@ -25,34 +25,33 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Stoppable;
+import org.apache.hadoop.hbase.conf.ConfigurationObserver;
 import org.apache.hadoop.hbase.io.HFileLink;
-import org.apache.hadoop.hbase.master.HMaster;
-import org.apache.hadoop.hbase.master.MasterServices;
 import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
 import org.apache.hadoop.hbase.util.StealJobQueue;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;
 /**
  * This Chore, every time it runs, will clear the HFiles in the hfile archive
  * folder that are deletable for each HFile cleaner in the chain.
  */
 @InterfaceAudience.Private
-public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate> {
-  private MasterServices master;
+public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate>
+  implements ConfigurationObserver {
 
   public static final String MASTER_HFILE_CLEANER_PLUGINS = "hbase.master.hfilecleaner.plugins";
 
   public HFileCleaner(final int period, final Stoppable stopper, Configuration conf, FileSystem fs,
-      Path directory) {
-    this(period, stopper, conf, fs, directory, null);
+    Path directory, DirScanPool pool) {
+    this(period, stopper, conf, fs, directory, pool, null);
   }
 
   // Configuration key for large/small throttle point
@@ -113,29 +112,47 @@ public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate> {
    * @param conf configuration to use
    * @param fs handle to the FS
    * @param directory directory to be cleaned
+   * @param pool the thread pool used to scan directories
    * @param params params could be used in subclass of BaseHFileCleanerDelegate
    */
   public HFileCleaner(final int period, final Stoppable stopper, Configuration conf, FileSystem fs,
-                      Path directory, Map<String, Object> params) {
-    super("HFileCleaner", period, stopper, conf, fs,
-      directory, MASTER_HFILE_CLEANER_PLUGINS, params);
+    Path directory, DirScanPool pool, Map<String, Object> params) {
+    this("HFileCleaner", period, stopper, conf, fs, directory, MASTER_HFILE_CLEANER_PLUGINS, pool,
+      params);
+
+  }
+
+  /**
+   * For creating customized HFileCleaner.
+   * @param name name of the chore being run
+   * @param period the period of time to sleep between each run
+   * @param stopper the stopper
+   * @param conf configuration to use
+   * @param fs handle to the FS
+   * @param directory directory to be cleaned
+   * @param confKey configuration key for the classes to instantiate
+   * @param pool the thread pool used to scan directories
+   * @param params params could be used in subclass of BaseHFileCleanerDelegate
+   */
+  public HFileCleaner(String name, int period, Stoppable stopper, Configuration conf, FileSystem fs,
+    Path directory, String confKey, DirScanPool pool, Map<String, Object> params) {
+    super(name, period, stopper, conf, fs, directory, confKey, pool, params);
     throttlePoint =
-        conf.getInt(HFILE_DELETE_THROTTLE_THRESHOLD, DEFAULT_HFILE_DELETE_THROTTLE_THRESHOLD);
+      conf.getInt(HFILE_DELETE_THROTTLE_THRESHOLD, DEFAULT_HFILE_DELETE_THROTTLE_THRESHOLD);
     largeQueueInitSize =
-        conf.getInt(LARGE_HFILE_QUEUE_INIT_SIZE, DEFAULT_LARGE_HFILE_QUEUE_INIT_SIZE);
+      conf.getInt(LARGE_HFILE_QUEUE_INIT_SIZE, DEFAULT_LARGE_HFILE_QUEUE_INIT_SIZE);
     smallQueueInitSize =
-        conf.getInt(SMALL_HFILE_QUEUE_INIT_SIZE, DEFAULT_SMALL_HFILE_QUEUE_INIT_SIZE);
+      conf.getInt(SMALL_HFILE_QUEUE_INIT_SIZE, DEFAULT_SMALL_HFILE_QUEUE_INIT_SIZE);
     largeFileQueue = new StealJobQueue<>(largeQueueInitSize, smallQueueInitSize, COMPARATOR);
     smallFileQueue = largeFileQueue.getStealFromQueue();
     largeFileDeleteThreadNumber =
-        conf.getInt(LARGE_HFILE_DELETE_THREAD_NUMBER, DEFAULT_LARGE_HFILE_DELETE_THREAD_NUMBER);
+      conf.getInt(LARGE_HFILE_DELETE_THREAD_NUMBER, DEFAULT_LARGE_HFILE_DELETE_THREAD_NUMBER);
     smallFileDeleteThreadNumber =
-        conf.getInt(SMALL_HFILE_DELETE_THREAD_NUMBER, DEFAULT_SMALL_HFILE_DELETE_THREAD_NUMBER);
+      conf.getInt(SMALL_HFILE_DELETE_THREAD_NUMBER, DEFAULT_SMALL_HFILE_DELETE_THREAD_NUMBER);
     cleanerThreadTimeoutMsec =
-        conf.getLong(HFILE_DELETE_THREAD_TIMEOUT_MSEC, DEFAULT_HFILE_DELETE_THREAD_TIMEOUT_MSEC);
-    cleanerThreadCheckIntervalMsec =
-        conf.getLong(HFILE_DELETE_THREAD_CHECK_INTERVAL_MSEC,
-            DEFAULT_HFILE_DELETE_THREAD_CHECK_INTERVAL_MSEC);
+      conf.getLong(HFILE_DELETE_THREAD_TIMEOUT_MSEC, DEFAULT_HFILE_DELETE_THREAD_TIMEOUT_MSEC);
+    cleanerThreadCheckIntervalMsec = conf.getLong(HFILE_DELETE_THREAD_CHECK_INTERVAL_MSEC,
+      DEFAULT_HFILE_DELETE_THREAD_CHECK_INTERVAL_MSEC);
     startHFileDeleteThreads();
   }
 
@@ -408,8 +425,6 @@ public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate> {
 
   @Override
   public void onConfigurationChange(Configuration conf) {
-    super.onConfigurationChange(conf);
-
     if (!checkAndUpdateConfigurations(conf)) {
       LOG.debug("Update configuration triggered but nothing changed for this cleaner");
       return;
@@ -497,12 +512,6 @@ public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate> {
     super.cancel(mayInterruptIfRunning);
     for (Thread t: this.threads) {
       t.interrupt();
-    }
-  }
-
-  public void init(Map<String, Object> params) {
-    if (params != null && params.containsKey(HMaster.MASTER)) {
-      this.master = (MasterServices) params.get(HMaster.MASTER);
     }
   }
 }

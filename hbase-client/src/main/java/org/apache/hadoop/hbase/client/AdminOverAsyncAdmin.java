@@ -132,6 +132,12 @@ class AdminOverAsyncAdmin implements Admin {
   }
 
   @Override
+  public List<TableDescriptor> listTableDescriptors(boolean includeSysTables)
+      throws IOException {
+    return get(admin.listTableDescriptors(includeSysTables));
+  }
+
+  @Override
   public List<TableDescriptor> listTableDescriptors(Pattern pattern, boolean includeSysTables)
       throws IOException {
     return get(admin.listTableDescriptors(pattern, includeSysTables));
@@ -942,4 +948,16 @@ class AdminOverAsyncAdmin implements Admin {
       throws IOException {
     return get(admin.hasUserPermissions(userName, permissions));
   }
+
+  @Override
+  public boolean snapshotCleanupSwitch(final boolean on, final boolean synchronous)
+      throws IOException {
+    return get(admin.snapshotCleanupSwitch(on, synchronous));
+  }
+
+  @Override
+  public boolean isSnapshotCleanupEnabled() throws IOException {
+    return get(admin.isSnapshotCleanupEnabled());
+  }
+
 }

@@ -98,6 +98,16 @@ module Hbase
       assert(list.count > 0)
     end
 
+    define_test 'list_deadservers should return exact count of dead servers' do
+      output = capture_stdout { command(:list_deadservers) }
+      assert(output.include?('0 row(s)'))
+    end
+
+    define_test 'clear_deadservers should show exact row(s) count' do
+      output = capture_stdout { command(:clear_deadservers, 'test.server.com,16020,1574583397867') }
+      assert(output.include?('1 row(s)'))
+    end
+
     #-------------------------------------------------------------------------------
 
     define_test "flush should work" do
@@ -106,6 +116,23 @@ module Hbase
       servers.each do |s|
         command(:flush, s.toString)
       end
+    end
+    #-------------------------------------------------------------------------------
+    define_test 'compact all regions by server name' do
+      servers = admin.list_liveservers
+      servers.each do |s|
+        command(:compact_rs, s.to_s)
+        # major compact
+        command(:compact_rs, s.to_s, true)
+        break
+      end
+    end
+
+    #-------------------------------------------------------------------------------
+
+    define_test 'alter_status should work' do
+      output = capture_stdout { command(:alter_status, @test_name) }
+      assert(output.include?('1/1 regions updated'))
     end
 
     #-------------------------------------------------------------------------------
@@ -181,6 +208,20 @@ module Hbase
         command(:create, 123, 'xxx')
       end
     end
+
+    #-------------------------------------------------------------------------------
+
+    define_test 'snapshot auto cleanup should work' do
+      command(:snapshot_cleanup_switch, true)
+      output = capture_stdout { command(:snapshot_cleanup_enabled) }
+      assert(output.include?('true'))
+
+      command(:snapshot_cleanup_switch, false)
+      output = capture_stdout { command(:snapshot_cleanup_enabled) }
+      assert(output.include?('false'))
+    end
+
+    #-------------------------------------------------------------------------------
 
     define_test "create should fail with non-string/non-hash column args" do
       assert_raise(ArgumentError) do
@@ -346,39 +387,59 @@ module Hbase
       assert(output.include?('0 row(s)'))
     end
 
+    define_test 'describe_namespace should return quota disabled' do
+      ns = 'ns'
+      quota_table = ::HBaseQuotasConstants::QUOTA_TABLE_NAME.to_s
+      drop_test_table(quota_table)
+      command(:create_namespace, ns)
+      output = capture_stdout { command(:describe_namespace, ns) }
+      # re-creating quota table otherwise other test case may fail
+      command(:create, quota_table, 'q', 'u')
+      assert(output.include?('Quota is disabled'))
+    end
+
     #-------------------------------------------------------------------------------
 
-    define_test "truncate should empty a table" do
-      table(@test_name).put(1, "x:a", 1)
-      table(@test_name).put(2, "x:a", 2)
+    define_test 'truncate should empty a table' do
+      table(@test_name).put(1, 'x:a', 1)
+      table(@test_name).put(2, 'x:a', 2)
       assert_equal(2, table(@test_name)._count_internal)
       # This is hacky.  Need to get the configuration into admin instance
       command(:truncate, @test_name)
       assert_equal(0, table(@test_name)._count_internal)
     end
 
-    define_test "truncate should yield log records" do
+    define_test 'truncate should yield log records' do
       output = capture_stdout { command(:truncate, @test_name) }
       assert(!output.empty?)
     end
 
+    define_test 'truncate should work on disabled table' do
+      table(@test_name).put(1, 'x:a', 1)
+      table(@test_name).put(2, 'x:a', 2)
+      assert_equal(2, table(@test_name)._count_internal)
+      command(:disable, @test_name)
+      command(:truncate, @test_name)
+      assert_equal(0, table(@test_name)._count_internal)
+    end
+
     #-------------------------------------------------------------------------------
 
-    define_test "truncate_preserve should empty a table" do
-      table(@test_name).put(1, "x:a", 1)
-      table(@test_name).put(2, "x:a", 2)
+    define_test 'truncate_preserve should empty a table' do
+      table(@test_name).put(1, 'x:a', 1)
+      table(@test_name).put(2, 'x:a', 2)
       assert_equal(2, table(@test_name)._count_internal)
       # This is hacky.  Need to get the configuration into admin instance
       command(:truncate_preserve, @test_name)
       assert_equal(0, table(@test_name)._count_internal)
     end
 
-    define_test "truncate_preserve should yield log records" do
+    define_test 'truncate_preserve should yield log records' do
       output = capture_stdout { command(:truncate_preserve, @test_name) }
       assert(!output.empty?)
     end
 
-    define_test "truncate_preserve should maintain the previous region boundaries" do
+    define_test 'truncate_preserve should maintain the previous region boundaries' do
       drop_test_table(@create_test_name)
       admin.create(@create_test_name, 'a', {NUMREGIONS => 10, SPLITALGO => 'HexStringSplit'})
       splits = table(@create_test_name)._get_splits_internal()
@@ -386,13 +447,24 @@ module Hbase
       assert_equal(splits, table(@create_test_name)._get_splits_internal())
     end
 
-    define_test "truncate_preserve should be fine when truncateTable method doesn't support" do
-      drop_test_table(@create_test_name)
-      admin.create(@create_test_name, 'a', {NUMREGIONS => 10, SPLITALGO => 'HexStringSplit'})
-      splits = table(@create_test_name)._get_splits_internal()
-      $TEST_CLUSTER.getConfiguration.setBoolean("hbase.client.truncatetable.support", false)
-      admin.truncate_preserve(@create_test_name, $TEST_CLUSTER.getConfiguration)
-      assert_equal(splits, table(@create_test_name)._get_splits_internal())
+    #-------------------------------------------------------------------------------
+
+    define_test 'enable and disable tables by regex' do
+      @t1 = 't1'
+      @t2 = 't11'
+      @regex = 't1.*'
+      command(:create, @t1, 'f')
+      command(:create, @t2, 'f')
+      admin.disable_all(@regex)
+      assert(command(:is_disabled, @t1))
+      assert(command(:is_disabled, @t2))
+      admin.enable_all(@regex)
+      assert(command(:is_enabled, @t1))
+      assert(command(:is_enabled, @t2))
+      admin.disable_all(@regex)
+      admin.drop_all(@regex)
+      assert(!command(:exists, @t1))
+      assert(!command(:exists, @t2))
     end
 
     #-------------------------------------------------------------------------------
@@ -521,6 +593,61 @@ module Hbase
 
     define_test "list regions should allow table name" do
       command(:list_regions, @test_name)
+    end
+
+    define_test 'merge regions' do
+      @t_name = 'hbase_shell_merge'
+      @t_name2 = 'hbase_shell_merge_2'
+      drop_test_table(@t_name)
+      drop_test_table(@t_name2)
+      admin.create(@t_name, 'a', NUMREGIONS => 10, SPLITALGO => 'HexStringSplit')
+      r1 = command(:locate_region, @t_name, '1')
+      r2 = command(:locate_region, @t_name, '2')
+      r3 = command(:locate_region, @t_name, '4')
+      r4 = command(:locate_region, @t_name, '5')
+      r5 = command(:locate_region, @t_name, '7')
+      r6 = command(:locate_region, @t_name, '8')
+      region1 = r1.getRegion.getRegionNameAsString
+      region2 = r2.getRegion.getRegionNameAsString
+      region3 = r3.getRegion.getRegionNameAsString
+      region4 = r4.getRegion.getRegionNameAsString
+      region5 = r5.getRegion.getRegionNameAsString
+      region6 = r6.getRegion.getRegionNameAsString
+      # only 1 region
+      assert_raise(ArgumentError) do
+        command(:merge_region, 'a')
+      end
+      # only 1 region with force=true
+      assert_raise(ArgumentError) do
+        command(:merge_region, 'a', true)
+      end
+      # non-existing region
+      assert_raise(RuntimeError) do
+        command(:merge_region, 'a','b')
+      end
+      # duplicate regions
+      assert_raise(RuntimeError) do
+        command(:merge_region, region1,region1,region1)
+      end
+      # 3 non-adjacent regions without forcible=true
+      assert_raise(RuntimeError) do
+        command(:merge_region, region1,region2,region4)
+      end
+      # 2 adjacent regions
+      command(:merge_region, region1,region2)
+      # 3 non-adjacent regions with forcible=true
+      command(:merge_region, region3,region5,region6, true)
+
+      admin.create(@t_name2, 'a', NUMREGIONS => 5, SPLITALGO => 'HexStringSplit')
+      r1 = command(:locate_region, @t_name2, '1')
+      r2 = command(:locate_region, @t_name2, '4')
+      r3 = command(:locate_region, @t_name2, '7')
+      region1 = r1.getRegion.getRegionNameAsString
+      region2 = r2.getRegion.getRegionNameAsString
+      region3 = r3.getRegion.getRegionNameAsString
+
+      # accept array of regions
+      command(:merge_region, [region1,region2,region3])
     end
   end
 

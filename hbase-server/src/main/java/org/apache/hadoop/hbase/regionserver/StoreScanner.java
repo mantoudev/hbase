@@ -23,7 +23,6 @@ import java.io.InterruptedIOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.NavigableSet;
-import java.util.OptionalInt;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -237,9 +236,10 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
 
     store.addChangedReaderObserver(this);
 
+    List<KeyValueScanner> scanners = null;
     try {
       // Pass columns to try to filter out unnecessary StoreFiles.
-      List<KeyValueScanner> scanners = selectScannersFrom(store,
+      scanners = selectScannersFrom(store,
         store.getScanners(cacheBlocks, scanUsePread, false, matcher, scan.getStartRow(),
           scan.includeStartRow(), scan.getStopRow(), scan.includeStopRow(), this.readPt));
 
@@ -259,6 +259,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       // Combine all seeked scanners with a heap
       resetKVHeap(scanners, comparator);
     } catch (IOException e) {
+      clearAndClose(scanners);
       // remove us from the HStore#changedReaderObservers here or we'll have no chance to
       // and might cause memory leak
       store.deleteChangedReaderObserver(this);
@@ -351,11 +352,11 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
 
   // Used to instantiate a scanner for compaction in test
   @VisibleForTesting
-  StoreScanner(ScanInfo scanInfo, OptionalInt maxVersions, ScanType scanType,
+  StoreScanner(ScanInfo scanInfo, int maxVersions, ScanType scanType,
       List<? extends KeyValueScanner> scanners) throws IOException {
     // 0 is passed as readpoint because the test bypasses Store
-    this(null, maxVersions.isPresent() ? new Scan().readVersions(maxVersions.getAsInt())
-        : SCAN_FOR_COMPACTION, scanInfo, 0, 0L, false, scanType);
+    this(null, maxVersions > 0 ? new Scan().readVersions(maxVersions)
+      : SCAN_FOR_COMPACTION, scanInfo, 0, 0L, false, scanType);
     this.matcher = CompactionScanQueryMatcher.create(scanInfo, scanType, Long.MAX_VALUE,
       HConstants.OLDEST_TIMESTAMP, oldestUnexpiredTS, now, null, null, null);
     seekAllScanner(scanInfo, scanners);
@@ -871,6 +872,9 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
   }
 
   private static void clearAndClose(List<KeyValueScanner> scanners) {
+    if (scanners == null) {
+      return;
+    }
     for (KeyValueScanner s : scanners) {
       s.close();
     }
@@ -895,12 +899,14 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
         // need for the updateReaders() to happen.
         LOG.debug("StoreScanner already has the close lock. There is no need to updateReaders");
         // no lock acquired.
+        clearAndClose(memStoreScanners);
         return;
       }
       // lock acquired
       updateReaders = true;
       if (this.closing) {
         LOG.debug("StoreScanner already closing. There is no need to updateReaders");
+        clearAndClose(memStoreScanners);
         return;
       }
       flushed = true;

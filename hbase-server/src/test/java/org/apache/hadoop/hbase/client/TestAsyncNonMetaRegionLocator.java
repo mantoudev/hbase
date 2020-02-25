@@ -79,7 +79,8 @@ public class TestAsyncNonMetaRegionLocator {
   public static void setUp() throws Exception {
     TEST_UTIL.startMiniCluster(3);
     TEST_UTIL.getAdmin().balancerSwitch(false, true);
-    AsyncRegistry registry = AsyncRegistryFactory.getRegistry(TEST_UTIL.getConfiguration());
+    ConnectionRegistry registry =
+        ConnectionRegistryFactory.getRegistry(TEST_UTIL.getConfiguration());
     CONN = new AsyncConnectionImpl(TEST_UTIL.getConfiguration(), registry,
       registry.getClusterId().get(), null, User.getCurrent());
     LOCATOR = new AsyncNonMetaRegionLocator(CONN);
@@ -398,5 +399,15 @@ public class TestAsyncNonMetaRegionLocator {
     // should locate to the only region
     assertArrayEquals(loc.getRegion().getStartKey(), EMPTY_START_ROW);
     assertArrayEquals(loc.getRegion().getEndKey(), EMPTY_END_ROW);
+  }
+
+  @Test
+  public void testConcurrentUpdateCachedLocationOnError() throws Exception {
+    createSingleRegionTable();
+    HRegionLocation loc =
+        getDefaultRegionLocation(TABLE_NAME, EMPTY_START_ROW, RegionLocateType.CURRENT, false)
+            .get();
+    IntStream.range(0, 100).parallel()
+        .forEach(i -> LOCATOR.updateCachedLocationOnError(loc, new NotServingRegionException()));
   }
 }

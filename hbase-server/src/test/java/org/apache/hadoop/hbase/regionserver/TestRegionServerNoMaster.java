@@ -122,7 +122,7 @@ public class TestRegionServerNoMaster {
     while (true) {
       sn = MetaTableLocator.getMetaRegionLocation(zkw);
       if (sn != null && sn.equals(hrs.getServerName())
-          && hrs.onlineRegions.containsKey(
+          && hrs.getOnlineRegions().containsKey(
               HRegionInfo.FIRST_META_REGIONINFO.getEncodedName())) {
         break;
       }
@@ -146,7 +146,9 @@ public class TestRegionServerNoMaster {
   @AfterClass
   public static void afterClass() throws Exception {
     HRegionServer.TEST_SKIP_REPORTING_TRANSITION = false;
-    table.close();
+    if (table != null) {
+      table.close();
+    }
     HTU.shutdownMiniCluster();
   }
 

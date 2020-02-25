@@ -33,6 +33,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -92,7 +93,6 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.S
 public class SplitTableRegionProcedure
     extends AbstractStateMachineRegionProcedure<SplitTableRegionState> {
   private static final Logger LOG = LoggerFactory.getLogger(SplitTableRegionProcedure.class);
-  private Boolean traceEnabled = null;
   private RegionInfo daughterOneRI;
   private RegionInfo daughterTwoRI;
   private byte[] bestSplitRow;
@@ -341,9 +341,7 @@ public class SplitTableRegionProcedure
   @Override
   protected void rollbackState(final MasterProcedureEnv env, final SplitTableRegionState state)
       throws IOException, InterruptedException {
-    if (isTraceEnabled()) {
-      LOG.trace(this + " rollback state=" + state);
-    }
+    LOG.trace("{} rollback state={}", this, state);
 
     try {
       switch (state) {
@@ -525,8 +523,9 @@ public class SplitTableRegionProcedure
       return false;
     }
 
-    // Since we have the lock and the master is coordinating the operation
-    // we are always able to split the region
+    // Mostly this check is not used because we already check the switch before submit a split
+    // procedure. Just for safe, check the switch again. This procedure can be rollbacked if
+    // the switch was set to false after submit.
     if (!env.getMasterServices().isSplitOrMergeEnabled(MasterSwitchType.SPLIT)) {
       LOG.warn("pid=" + getProcId() + " split switch is off! skip split of " + parentHRI);
       setFailure(new IOException("Split region " + parentHRI.getRegionNameAsString() +
@@ -545,6 +544,8 @@ public class SplitTableRegionProcedure
     // set node state as SPLITTING
     node.setState(State.SPLITTING);
 
+    // Since we have the lock and the master is coordinating the operation
+    // we are always able to split the region
     return true;
   }
 
@@ -624,7 +625,6 @@ public class SplitTableRegionProcedure
    */
   private Pair<Integer, Integer> splitStoreFiles(final MasterProcedureEnv env,
       final HRegionFileSystem regionFs) throws IOException {
-    final MasterFileSystem mfs = env.getMasterServices().getMasterFileSystem();
     final Configuration conf = env.getMasterConfiguration();
     TableDescriptor htd = env.getMasterServices().getTableDescriptors().get(getTableName());
     // The following code sets up a thread pool executor with as many slots as
@@ -675,7 +675,7 @@ public class SplitTableRegionProcedure
     LOG.info("pid=" + getProcId() + " splitting " + nbFiles + " storefiles, region=" +
         getParentRegion().getShortNameToLog() + ", threads=" + maxThreads);
     final ExecutorService threadPool = Executors.newFixedThreadPool(maxThreads,
-      Threads.getNamedThreadFactory("StoreFileSplitter-%1$d"));
+      Threads.newDaemonThreadFactory("StoreFileSplitter-%1$d"));
     final List<Future<Pair<Path, Path>>> futures = new ArrayList<Future<Pair<Path, Path>>>(nbFiles);
 
     // Split each store file.
@@ -688,8 +688,8 @@ public class SplitTableRegionProcedure
           // As this procedure is running on master, use CacheConfig.DISABLED means
           // don't cache any block.
           StoreFileSplitter sfs =
-              new StoreFileSplitter(regionFs, familyName, new HStoreFile(mfs.getFileSystem(),
-                  storeFileInfo, conf, CacheConfig.DISABLED, hcd.getBloomFilterType(), true));
+              new StoreFileSplitter(regionFs, familyName, new HStoreFile(
+                  storeFileInfo, hcd.getBloomFilterType(), CacheConfig.DISABLED));
           futures.add(threadPool.submit(sfs));
         }
       }
@@ -885,18 +885,6 @@ public class SplitTableRegionProcedure
       WALSplitUtil.writeRegionSequenceIdFile(fs.getWALFileSystem(),
         getWALRegionDir(env, daughterTwoRI), maxSequenceId);
     }
-  }
-
-  /**
-   * The procedure could be restarted from a different machine. If the variable is null, we need to
-   * retrieve it.
-   * @return traceEnabled
-   */
-  private boolean isTraceEnabled() {
-    if (traceEnabled == null) {
-      traceEnabled = LOG.isTraceEnabled();
-    }
-    return traceEnabled;
   }
 
   @Override

@@ -55,7 +55,7 @@ org.apache.hadoop.hbase.quotas.QuotaUtil;
 org.apache.hadoop.hbase.security.access.PermissionStorage;
 org.apache.hadoop.hbase.security.visibility.VisibilityConstants;
 org.apache.hadoop.hbase.shaded.protobuf.generated.SnapshotProtos.SnapshotDescription;
-org.apache.hadoop.hbase.tool.Canary;
+org.apache.hadoop.hbase.tool.CanaryTool;
 org.apache.hadoop.hbase.util.Bytes;
 org.apache.hadoop.hbase.util.FSUtils;
 org.apache.hadoop.hbase.util.JvmVersion;
@@ -151,6 +151,9 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
                 <%if master.isActiveMaster() %>
                     <li><a href="/procedures.jsp">Procedures &amp; Locks</a></li>
                     <li><a href="/hbck.jsp">HBCK Report</a></li>
+                    <%if master.getConfiguration().getBoolean(QuotaUtil.QUOTA_CONF_KEY, false) %>
+                        <li><a href="/quotas.jsp">Quotas</a></li>
+                    </%if>
                 </%if>
                 <li><a href="/processMaster.jsp">Process Metrics</a></li>
                 <li><a href="/logs/">Local Logs</a></li>
@@ -192,8 +195,8 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
         </%if>
         <%if master.isInMaintenanceMode() %>
           <div class="alert alert-warning">
-          Your Master is in maintenance mode. This may be because of HBCK aborting while
-          running in repair mode. Please re-run HBCK in repair mode.
+          Your Master is in maintenance mode. This is because hbase.master.maintenance_mode is
+          set to true. Under the maintenance mode, no quota or no Master coprocessor is loaded.
           </div>
         </%if>
         <%if !master.isBalancerOn() %>
@@ -220,11 +223,14 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
         <%if master.getAssignmentManager() != null %>
           <& AssignmentManagerStatusTmpl; assignmentManager=master.getAssignmentManager()&>
         </%if>
-        <%if master.getMasterCoprocessorHost().findCoprocessor("RSGroupAdminEndpoint") != null %>
-          <section>
-            <h2><a name="rsgroup">RSGroup</a></h2>
-            <& RSGroupListTmpl; master= master; serverManager= serverManager&>
-          </section>
+        <%if !master.isInMaintenanceMode() %>
+          <%if master.getMasterCoprocessorHost().findCoprocessor("RSGroupAdminEndpoint") != null &&
+            serverManager.getOnlineServersList().size() > 0 %>
+            <section>
+              <h2><a name="rsgroup">RSGroup</a></h2>
+              <& RSGroupListTmpl; master= master; serverManager= serverManager&>
+            </section>
+          </%if>
         </%if>
         <section>
             <h2><a name="regionservers">Region Servers</a></h2>
@@ -401,6 +407,7 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
     <script src="/static/js/jquery.tablesorter.min.js" type="text/javascript"></script>
     <script src="/static/js/bootstrap.min.js" type="text/javascript"></script>
     <script src="/static/js/tab.js" type="text/javascript"></script>
+    <script src="/static/js/jqSpager.js" type="text/javascript"></script>
     <script>
     $(document).ready(function()
         {
@@ -477,6 +484,34 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
             });
 
             $("#userTables").tablesorter();
+
+            function showRitPages() {
+                if (!$("#rit_page_num")) {
+                  return;
+                }
+                var ritTotalNum = parseInt($("#rit_page_num").val());
+                if (!ritTotalNum || ritTotalNum < 1) {
+                  return;
+                }
+
+                 $("#rit_pagination").sPage({
+                      page:1,
+                      total:ritTotalNum,
+                      pageSize:5,
+                      noData: false,
+                      showPN:true,
+                      prevPage:"prev",
+                      nextPage:"next",
+                      fastForward: 5,
+                      backFun:function(page){
+                          $("div[id^='tab_rits']").removeClass('active');
+                          $("#tab_rits"+page).addClass('active');
+                      }
+                  });
+
+            }
+            showRitPages();
+
         }
     );
     </script>
@@ -508,7 +543,7 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
     <%java>String description = null;
         if (tableName.equals(TableName.META_TABLE_NAME)){
             description = "The hbase:meta table holds references to all User Table regions.";
-        } else if (tableName.equals(Canary.DEFAULT_WRITE_TABLE_NAME)){
+        } else if (tableName.equals(CanaryTool.DEFAULT_WRITE_TABLE_NAME)){
             description = "The hbase:canary table is used to sniff the write availbility of"
               + " each regionserver.";
         } else if (tableName.equals(PermissionStorage.ACL_TABLE_NAME)){

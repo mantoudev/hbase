@@ -17,6 +17,8 @@
  */
 package org.apache.hadoop.hbase.wal;
 
+import static org.apache.hadoop.hbase.wal.BoundedRecoveredHFilesOutputSink.DEFAULT_WAL_SPLIT_TO_HFILE;
+import static org.apache.hadoop.hbase.wal.BoundedRecoveredHFilesOutputSink.WAL_SPLIT_TO_HFILE;
 import static org.apache.hadoop.hbase.wal.WALSplitUtil.finishSplitLogFile;
 
 import java.io.EOFException;
@@ -38,21 +40,19 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.coordination.SplitLogWorkerCoordination;
-import org.apache.hadoop.hbase.io.HeapSize;
 import org.apache.hadoop.hbase.master.SplitLogManager;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
 import org.apache.hadoop.hbase.monitoring.TaskMonitor;
+import org.apache.hadoop.hbase.procedure2.util.StringUtils;
 import org.apache.hadoop.hbase.regionserver.LastSequenceId;
 import org.apache.hadoop.hbase.regionserver.wal.WALCellCodec;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CancelableProgressable;
-import org.apache.hadoop.hbase.util.ClassSize;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.hadoop.hbase.wal.WAL.Reader;
-import org.apache.hadoop.hbase.wal.WALProvider.Writer;
 import org.apache.hadoop.hbase.zookeeper.ZKSplitLog;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -105,15 +105,16 @@ public class WALSplitter {
   // the file being split currently
   private FileStatus fileBeingSplit;
 
-  // if we limit the number of writers opened for sinking recovered edits
-  private final boolean splitWriterCreationBounded;
+  private final String tmpDirName;
 
   public final static String SPLIT_WRITER_CREATION_BOUNDED = "hbase.split.writer.creation.bounded";
-
+  public final static String SPLIT_WAL_BUFFER_SIZE = "hbase.regionserver.hlog.splitlog.buffersize";
+  public final static String SPLIT_WAL_WRITER_THREADS =
+      "hbase.regionserver.hlog.splitlog.writer.threads";
 
   @VisibleForTesting
   WALSplitter(final WALFactory factory, Configuration conf, Path walDir, FileSystem walFS,
-      LastSequenceId idChecker, SplitLogWorkerCoordination splitLogWorkerCoordination) {
+    LastSequenceId idChecker, SplitLogWorkerCoordination splitLogWorkerCoordination) {
     this.conf = HBaseConfiguration.create(conf);
     String codecClassName =
         conf.get(WALCellCodec.WAL_CELL_CODEC_CLASS_KEY, WALCellCodec.class.getName());
@@ -125,20 +126,26 @@ public class WALSplitter {
 
     this.walFactory = factory;
     PipelineController controller = new PipelineController();
+    this.tmpDirName =
+      conf.get(HConstants.TEMPORARY_FS_DIRECTORY_KEY, HConstants.DEFAULT_TEMPORARY_HDFS_DIRECTORY);
 
-    this.splitWriterCreationBounded = conf.getBoolean(SPLIT_WRITER_CREATION_BOUNDED, false);
+    // if we limit the number of writers opened for sinking recovered edits
+    boolean splitWriterCreationBounded = conf.getBoolean(SPLIT_WRITER_CREATION_BOUNDED, false);
+    boolean splitToHFile = conf.getBoolean(WAL_SPLIT_TO_HFILE, DEFAULT_WAL_SPLIT_TO_HFILE);
+    long bufferSize = this.conf.getLong(SPLIT_WAL_BUFFER_SIZE, 128 * 1024 * 1024);
+    int numWriterThreads = this.conf.getInt(SPLIT_WAL_WRITER_THREADS, 3);
 
-    entryBuffers = new EntryBuffers(controller,
-        this.conf.getLong("hbase.regionserver.hlog.splitlog.buffersize", 128 * 1024 * 1024),
-        splitWriterCreationBounded);
-
-    int numWriterThreads = this.conf.getInt("hbase.regionserver.hlog.splitlog.writer.threads", 3);
-    if (splitWriterCreationBounded) {
+    if (splitToHFile) {
+      entryBuffers = new BoundedEntryBuffers(controller, bufferSize);
       outputSink =
-          new BoundedLogWriterCreationOutputSink(this, controller, entryBuffers, numWriterThreads);
+          new BoundedRecoveredHFilesOutputSink(this, controller, entryBuffers, numWriterThreads);
+    } else if (splitWriterCreationBounded) {
+      entryBuffers = new BoundedEntryBuffers(controller, bufferSize);
+      outputSink =
+          new BoundedRecoveredEditsOutputSink(this, controller, entryBuffers, numWriterThreads);
     } else {
-      outputSink =
-          new LogRecoveredEditsOutputSink(this, controller, entryBuffers, numWriterThreads);
+      entryBuffers = new EntryBuffers(controller, bufferSize);
+      outputSink = new RecoveredEditsOutputSink(this, controller, entryBuffers, numWriterThreads);
     }
   }
 
@@ -148,6 +155,10 @@ public class WALSplitter {
 
   FileStatus getFileBeingSplit() {
     return fileBeingSplit;
+  }
+
+  String getTmpDirName() {
+    return this.tmpDirName;
   }
 
   Map<String, Map<byte[], Long>> getRegionMaxSeqIdInStores() {
@@ -213,7 +224,7 @@ public class WALSplitter {
     int interval = conf.getInt("hbase.splitlog.report.interval.loglines", 1024);
     Path logPath = logfile.getPath();
     boolean outputSinkStarted = false;
-    boolean progress_failed = false;
+    boolean progressFailed = false;
     int editsCount = 0;
     int editsSkipped = 0;
 
@@ -221,12 +232,14 @@ public class WALSplitter {
           "Splitting log file " + logfile.getPath() + "into a temporary staging area.");
     Reader logFileReader = null;
     this.fileBeingSplit = logfile;
+    long startTS = EnvironmentEdgeManager.currentTime();
     try {
       long logLength = logfile.getLen();
-      LOG.info("Splitting WAL={}, length={}", logPath, logLength);
+      LOG.info("Splitting WAL={}, size={} ({} bytes)", logPath, StringUtils.humanSize(logLength),
+          logLength);
       status.setStatus("Opening log file");
       if (reporter != null && !reporter.progress()) {
-        progress_failed = true;
+        progressFailed = true;
         return false;
       }
       logFileReader = getReader(logfile, skipErrors, reporter);
@@ -234,6 +247,8 @@ public class WALSplitter {
         LOG.warn("Nothing to split in WAL={}", logPath);
         return true;
       }
+      long openCost = EnvironmentEdgeManager.currentTime() - startTS;
+      LOG.info("Open WAL={} cost {} ms", logPath, openCost);
       int numOpenedFilesBeforeReporting = conf.getInt("hbase.splitlog.report.openedfiles", 3);
       int numOpenedFilesLastCheck = 0;
       outputSink.setReporter(reporter);
@@ -241,6 +256,7 @@ public class WALSplitter {
       outputSinkStarted = true;
       Entry entry;
       Long lastFlushedSequenceId = -1L;
+      startTS = EnvironmentEdgeManager.currentTime();
       while ((entry = getNextLogLine(logFileReader, logPath, skipErrors)) != null) {
         byte[] region = entry.getKey().getEncodedRegionName();
         String encodedRegionNameAsStr = Bytes.toString(region);
@@ -281,11 +297,11 @@ public class WALSplitter {
         if (editsCount % interval == 0
             || moreWritersFromLastCheck > numOpenedFilesBeforeReporting) {
           numOpenedFilesLastCheck = this.getNumOpenWriters();
-          String countsStr = (editsCount - (editsSkipped + outputSink.getSkippedEdits()))
+          String countsStr = (editsCount - (editsSkipped + outputSink.getTotalSkippedEdits()))
               + " edits, skipped " + editsSkipped + " edits.";
           status.setStatus("Split " + countsStr);
           if (reporter != null && !reporter.progress()) {
-            progress_failed = true;
+            progressFailed = true;
             return false;
           }
         }
@@ -319,27 +335,29 @@ public class WALSplitter {
       try {
         if (outputSinkStarted) {
           // Set progress_failed to true as the immediate following statement will reset its value
-          // when finishWritingAndClose() throws exception, progress_failed has the right value
-          progress_failed = true;
-          progress_failed = outputSink.finishWritingAndClose() == null;
+          // when close() throws exception, progress_failed has the right value
+          progressFailed = true;
+          progressFailed = outputSink.close() == null;
         }
       } finally {
-        String msg =
-            "Processed " + editsCount + " edits across " + outputSink.getNumberOfRecoveredRegions()
-                + " regions; edits skipped=" + editsSkipped + "; log file=" + logPath +
-                ", length=" + logfile.getLen() + // See if length got updated post lease recovery
-                ", corrupted=" + isCorrupted + ", progress failed=" + progress_failed;
+        long processCost = EnvironmentEdgeManager.currentTime() - startTS;
+        // See if length got updated post lease recovery
+        String msg = "Processed " + editsCount + " edits across " +
+            outputSink.getNumberOfRecoveredRegions() + " regions cost " + processCost +
+            " ms; edits skipped=" + editsSkipped + "; WAL=" + logPath + ", size=" +
+            StringUtils.humanSize(logfile.getLen()) + ", length=" + logfile.getLen() +
+            ", corrupted=" + isCorrupted + ", progress failed=" + progressFailed;
         LOG.info(msg);
         status.markComplete(msg);
       }
     }
-    return !progress_failed;
+    return !progressFailed;
   }
 
   /**
    * Create a new {@link Reader} for reading logs to split.
    */
-  protected Reader getReader(FileStatus file, boolean skipErrors, CancelableProgressable reporter)
+  private Reader getReader(FileStatus file, boolean skipErrors, CancelableProgressable reporter)
       throws IOException, CorruptedLogFileException {
     Path path = file.getPath();
     long length = file.getLen();
@@ -377,16 +395,13 @@ public class WALSplitter {
       if (!skipErrors || e instanceof InterruptedIOException) {
         throw e; // Don't mark the file corrupted if interrupted, or not skipErrors
       }
-      CorruptedLogFileException t =
-        new CorruptedLogFileException("skipErrors=true Could not open wal " +
-            path + " ignoring");
-      t.initCause(e);
-      throw t;
+      throw new CorruptedLogFileException("skipErrors=true Could not open wal "
+        + path + " ignoring", e);
     }
     return in;
   }
 
-  static private Entry getNextLogLine(Reader in, Path path, boolean skipErrors)
+  private Entry getNextLogLine(Reader in, Path path, boolean skipErrors)
       throws CorruptedLogFileException, IOException {
     try {
       return in.next();
@@ -405,11 +420,8 @@ public class WALSplitter {
       if (!skipErrors) {
         throw e;
       }
-      CorruptedLogFileException t =
-          new CorruptedLogFileException("skipErrors=true Ignoring exception" + " while parsing wal "
-              + path + ". Marking as corrupted");
-      t.initCause(e);
-      throw t;
+      throw new CorruptedLogFileException("skipErrors=true Ignoring exception"
+        + " while parsing wal " + path + ". Marking as corrupted", e);
     }
   }
 
@@ -472,103 +484,21 @@ public class WALSplitter {
     }
   }
 
-  /**
-   * A buffer of some number of edits for a given region.
-   * This accumulates edits and also provides a memory optimization in order to
-   * share a single byte array instance for the table and region name.
-   * Also tracks memory usage of the accumulated edits.
-   */
-  public static class RegionEntryBuffer implements HeapSize {
-    long heapInBuffer = 0;
-    List<Entry> entryBuffer;
-    TableName tableName;
-    byte[] encodedRegionName;
-
-    RegionEntryBuffer(TableName tableName, byte[] region) {
-      this.tableName = tableName;
-      this.encodedRegionName = region;
-      this.entryBuffer = new ArrayList<>();
-    }
-
-    long appendEntry(Entry entry) {
-      internify(entry);
-      entryBuffer.add(entry);
-      long incrHeap = entry.getEdit().heapSize() +
-        ClassSize.align(2 * ClassSize.REFERENCE) + // WALKey pointers
-        0; // TODO linkedlist entry
-      heapInBuffer += incrHeap;
-      return incrHeap;
-    }
-
-    private void internify(Entry entry) {
-      WALKeyImpl k = entry.getKey();
-      k.internTableName(this.tableName);
-      k.internEncodedRegionName(this.encodedRegionName);
-    }
-
-    @Override
-    public long heapSize() {
-      return heapInBuffer;
-    }
-
-    public byte[] getEncodedRegionName() {
-      return encodedRegionName;
-    }
-
-    public List<Entry> getEntryBuffer() {
-      return entryBuffer;
-    }
-
-    public TableName getTableName() {
-      return tableName;
-    }
-  }
-
-  /**
-   * Class wraps the actual writer which writes data out and related statistics
-   */
-  public abstract static class SinkWriter {
-    /* Count of edits written to this path */
-    long editsWritten = 0;
-    /* Count of edits skipped to this path */
-    long editsSkipped = 0;
-    /* Number of nanos spent writing to this log */
-    long nanosSpent = 0;
-
-    void incrementEdits(int edits) {
-      editsWritten += edits;
-    }
-
-    void incrementSkippedEdits(int skipped) {
-      editsSkipped += skipped;
-    }
-
-    void incrementNanoTime(long nanos) {
-      nanosSpent += nanos;
-    }
-  }
-
-  /**
-   * Private data structure that wraps a Writer and its Path, also collecting statistics about the
-   * data written to this output.
-   */
-  final static class WriterAndPath extends SinkWriter {
-    final Path path;
-    final Writer writer;
-    final long minLogSeqNum;
-
-    WriterAndPath(final Path path, final Writer writer, final long minLogSeqNum) {
-      this.path = path;
-      this.writer = writer;
-      this.minLogSeqNum = minLogSeqNum;
-    }
-  }
-
   static class CorruptedLogFileException extends Exception {
     private static final long serialVersionUID = 1L;
 
     CorruptedLogFileException(String s) {
       super(s);
+    }
+
+    /**
+     * CorruptedLogFileException with cause
+     *
+     * @param message the message for this exception
+     * @param cause the cause for this exception
+     */
+    CorruptedLogFileException(String message, Throwable cause) {
+      super(message, cause);
     }
   }
 }

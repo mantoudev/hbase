@@ -39,9 +39,9 @@ import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.fs.HFileSystem;
 import org.apache.hadoop.hbase.log.HBaseMarkers;
 import org.apache.hadoop.hbase.mob.MobConstants;
-import org.apache.hadoop.hbase.procedure2.store.wal.WALProcedureStore;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.replication.ReplicationUtils;
+import org.apache.hadoop.hbase.security.access.SnapshotScannerHDFSAclHelper;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FSTableDescriptors;
 import org.apache.hadoop.hbase.util.FSUtils;
@@ -143,11 +143,12 @@ public class MasterFileSystem {
         MobConstants.MOB_DIR_NAME
     };
 
+    //With the introduction of RegionProcedureStore,
+    // there's no need to create MasterProcWAL dir here anymore. See HBASE-23715
     final String[] protectedSubLogDirs = new String[] {
       HConstants.HREGION_LOGDIR_NAME,
       HConstants.HREGION_OLDLOGDIR_NAME,
       HConstants.CORRUPT_DIR_NAME,
-      WALProcedureStore.MASTER_PROCEDURE_LOGDIR,
       ReplicationUtils.REMOTE_WAL_DIR_NAME
     };
     // check if the root directory exists
@@ -274,9 +275,7 @@ public class MasterFileSystem {
     } catch (DeserializationException de) {
       LOG.error(HBaseMarkers.FATAL, "Please fix invalid configuration for "
         + HConstants.HBASE_DIR, de);
-      IOException ioe = new IOException();
-      ioe.initCause(de);
-      throw ioe;
+      throw new IOException(de);
     } catch (IllegalArgumentException iae) {
       LOG.error(HBaseMarkers.FATAL, "Please fix invalid configuration for "
         + HConstants.HBASE_DIR + " " + rd.toString(), iae);
@@ -318,20 +317,26 @@ public class MasterFileSystem {
       for (Path tableDir: FSUtils.getTableDirs(fs, tmpdir)) {
         HFileArchiver.archiveRegions(c, fs, this.rootdir, tableDir,
           FSUtils.getRegionDirs(fs, tableDir));
+        if (!FSUtils.getRegionDirs(fs, tableDir).isEmpty()) {
+          LOG.warn("Found regions in tmp dir after archiving table regions, {}", tableDir);
+        }
       }
-      if (!fs.delete(tmpdir, true)) {
+      // if acl sync to hdfs is enabled, then skip delete tmp dir because ACLs are set
+      if (!SnapshotScannerHDFSAclHelper.isAclSyncToHdfsEnabled(c) && !fs.delete(tmpdir, true)) {
         throw new IOException("Unable to clean the temp directory: " + tmpdir);
       }
     }
 
     // Create the temp directory
-    if (isSecurityEnabled) {
-      if (!fs.mkdirs(tmpdir, secureRootSubDirPerms)) {
-        throw new IOException("HBase temp directory '" + tmpdir + "' creation failure.");
-      }
-    } else {
-      if (!fs.mkdirs(tmpdir)) {
-        throw new IOException("HBase temp directory '" + tmpdir + "' creation failure.");
+    if (!fs.exists(tmpdir)) {
+      if (isSecurityEnabled) {
+        if (!fs.mkdirs(tmpdir, secureRootSubDirPerms)) {
+          throw new IOException("HBase temp directory '" + tmpdir + "' creation failure.");
+        }
+      } else {
+        if (!fs.mkdirs(tmpdir)) {
+          throw new IOException("HBase temp directory '" + tmpdir + "' creation failure.");
+        }
       }
     }
   }

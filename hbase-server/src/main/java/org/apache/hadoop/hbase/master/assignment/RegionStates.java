@@ -37,11 +37,11 @@ import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.RegionInfo;
-import org.apache.hadoop.hbase.client.RegionReplicaUtil;
+import org.apache.hadoop.hbase.client.TableState;
 import org.apache.hadoop.hbase.master.RegionState;
 import org.apache.hadoop.hbase.master.RegionState.State;
+import org.apache.hadoop.hbase.master.TableStateManager;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.util.ServerRegionReplicaUtil;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,10 +76,17 @@ public class RegionStates {
    * RegionName -- i.e. RegionInfo.getRegionName() -- as bytes to {@link RegionStateNode}
    */
   private final ConcurrentSkipListMap<byte[], RegionStateNode> regionsMap =
-      new ConcurrentSkipListMap<byte[], RegionStateNode>(Bytes.BYTES_COMPARATOR);
+      new ConcurrentSkipListMap<>(Bytes.BYTES_COMPARATOR);
+
+  /**
+   * this map is a hack to lookup of region in master by encoded region name is O(n).
+   * must put and remove with regionsMap.
+   */
+  private final ConcurrentSkipListMap<String, RegionStateNode> encodedRegionsMap =
+    new ConcurrentSkipListMap<>();
 
   private final ConcurrentSkipListMap<RegionInfo, RegionStateNode> regionInTransition =
-    new ConcurrentSkipListMap<RegionInfo, RegionStateNode>(RegionInfo.COMPARATOR);
+    new ConcurrentSkipListMap<>(RegionInfo.COMPARATOR);
 
   /**
    * Regions marked as offline on a read of hbase:meta. Unused or at least, once
@@ -96,8 +103,12 @@ public class RegionStates {
 
   public RegionStates() { }
 
+  /**
+   * Called on stop of AssignmentManager.
+   */
   public void clear() {
     regionsMap.clear();
+    encodedRegionsMap.clear();
     regionInTransition.clear();
     regionOffline.clear();
     serverMap.clear();
@@ -114,9 +125,11 @@ public class RegionStates {
   // ==========================================================================
   @VisibleForTesting
   RegionStateNode createRegionStateNode(RegionInfo regionInfo) {
-    RegionStateNode newNode = new RegionStateNode(regionInfo, regionInTransition);
-    RegionStateNode oldNode = regionsMap.putIfAbsent(regionInfo.getRegionName(), newNode);
-    return oldNode != null ? oldNode : newNode;
+    return regionsMap.computeIfAbsent(regionInfo.getRegionName(), key -> {
+      final RegionStateNode node = new RegionStateNode(regionInfo, regionInTransition);
+      encodedRegionsMap.putIfAbsent(regionInfo.getEncodedName(), node);
+      return node;
+    });
   }
 
   public RegionStateNode getOrCreateRegionStateNode(RegionInfo regionInfo) {
@@ -134,6 +147,7 @@ public class RegionStates {
 
   public void deleteRegion(final RegionInfo regionInfo) {
     regionsMap.remove(regionInfo.getRegionName());
+    encodedRegionsMap.remove(regionInfo.getEncodedName());
     // See HBASE-20860
     // After master restarts, merged regions' RIT state may not be cleaned,
     // making sure they are cleaned here
@@ -201,13 +215,11 @@ public class RegionStates {
   }
 
   public RegionState getRegionState(final String encodedRegionName) {
-    // TODO: Need a map <encodedName, ...> but it is just dispatch merge...
-    for (RegionStateNode node: regionsMap.values()) {
-      if (node.getRegionInfo().getEncodedName().equals(encodedRegionName)) {
-        return node.toRegionState();
-      }
+    final RegionStateNode node = encodedRegionsMap.get(encodedRegionName);
+    if (node == null) {
+      return null;
     }
-    return null;
+    return node.toRegionState();
   }
 
   // ============================================================================================
@@ -352,9 +364,13 @@ public class RegionStates {
     if (LOG.isTraceEnabled()) {
       LOG.trace("WORKING ON " + node + " " + node.getRegionInfo());
     }
-    if (node.isInState(State.SPLIT)) return false;
-    if (node.isInState(State.OFFLINE) && !offline) return false;
     final RegionInfo hri = node.getRegionInfo();
+    if (node.isInState(State.SPLIT) || hri.isSplit()) {
+      return false;
+    }
+    if ((node.isInState(State.OFFLINE) || hri.isOffline()) && !offline) {
+      return false;
+    }
     return (!hri.isOffline() && !hri.isSplit()) ||
         ((hri.isOffline() || hri.isSplit()) && offline);
   }
@@ -536,10 +552,13 @@ public class RegionStates {
    * @return A clone of current assignments.
    */
   public Map<TableName, Map<ServerName, List<RegionInfo>>> getAssignmentsForBalancer(
-      boolean isByTable) {
+    TableStateManager tableStateManager, List<ServerName> onlineServers, boolean isByTable) {
     final Map<TableName, Map<ServerName, List<RegionInfo>>> result = new HashMap<>();
     if (isByTable) {
       for (RegionStateNode node : regionsMap.values()) {
+        if (isTableDisabled(tableStateManager, node.getTable())) {
+          continue;
+        }
         Map<ServerName, List<RegionInfo>> tableResult =
             result.computeIfAbsent(node.getTable(), t -> new HashMap<>());
         final ServerName serverName = node.getRegionLocation();
@@ -553,19 +572,32 @@ public class RegionStates {
       }
       // Add online servers with no assignment for the table.
       for (Map<ServerName, List<RegionInfo>> table : result.values()) {
-        for (ServerName serverName : serverMap.keySet()) {
-          table.putIfAbsent(serverName, new ArrayList<>());
+        for (ServerName serverName : onlineServers) {
+          table.computeIfAbsent(serverName, key -> new ArrayList<>());
         }
       }
     } else {
       final HashMap<ServerName, List<RegionInfo>> ensemble = new HashMap<>(serverMap.size());
-      for (ServerStateNode serverNode : serverMap.values()) {
-        ensemble.put(serverNode.getServerName(), serverNode.getRegionInfoList());
+      for (ServerName serverName : onlineServers) {
+        ServerStateNode serverNode = serverMap.get(serverName);
+        if (serverNode != null) {
+          ensemble.put(serverNode.getServerName(), serverNode.getRegionInfoList().stream()
+            .filter(region -> !isTableDisabled(tableStateManager, region.getTable()))
+            .collect(Collectors.toList()));
+        } else {
+          ensemble.put(serverName, new ArrayList<>());
+        }
       }
       // Use a fake table name to represent the whole cluster's assignments
       result.put(HConstants.ENSEMBLE_TABLE_NAME, ensemble);
     }
     return result;
+  }
+
+  private boolean isTableDisabled(final TableStateManager tableStateManager,
+    final TableName tableName) {
+    return tableStateManager
+      .isTableState(tableName, TableState.State.DISABLED, TableState.State.DISABLING);
   }
 
   // ==========================================================================
@@ -675,13 +707,7 @@ public class RegionStates {
 
   public RegionFailedOpen addToFailedOpen(final RegionStateNode regionNode) {
     final byte[] key = regionNode.getRegionInfo().getRegionName();
-    RegionFailedOpen node = regionFailedOpen.get(key);
-    if (node == null) {
-      RegionFailedOpen newNode = new RegionFailedOpen(regionNode);
-      RegionFailedOpen oldNode = regionFailedOpen.putIfAbsent(key, newNode);
-      node = oldNode != null ? oldNode : newNode;
-    }
-    return node;
+    return regionFailedOpen.computeIfAbsent(key, (k) -> new RegionFailedOpen(regionNode));
   }
 
   public RegionFailedOpen getFailedOpen(final RegionInfo regionInfo) {
@@ -712,19 +738,19 @@ public class RegionStates {
    * to {@link #getServerNode(ServerName)} where we can.
    */
   public ServerStateNode getOrCreateServer(final ServerName serverName) {
-    ServerStateNode node = serverMap.get(serverName);
-    if (node == null) {
-      node = new ServerStateNode(serverName);
-      ServerStateNode oldNode = serverMap.putIfAbsent(serverName, node);
-      node = oldNode != null ? oldNode : node;
-    }
-    return node;
+    return serverMap.computeIfAbsent(serverName, key -> new ServerStateNode(key));
   }
 
+  /**
+   * Called by SCP at end of successful processing.
+   */
   public void removeServer(final ServerName serverName) {
     serverMap.remove(serverName);
   }
 
+  /**
+   * @return Pertinent ServerStateNode or NULL if none found (Do not make modifications).
+   */
   @VisibleForTesting
   public ServerStateNode getServerNode(final ServerName serverName) {
     return serverMap.get(serverName);
@@ -744,26 +770,6 @@ public class RegionStates {
     ServerStateNode serverNode = getOrCreateServer(regionNode.getRegionLocation());
     serverNode.addRegion(regionNode);
     return serverNode;
-  }
-
-  public boolean isReplicaAvailableForRegion(final RegionInfo info) {
-    // if the region info itself is a replica return true.
-    if (!RegionReplicaUtil.isDefaultReplica(info)) {
-      return true;
-    }
-    // iterate the regionsMap for the given region name. If there are replicas it should
-    // list them in order.
-    for (RegionStateNode node : regionsMap.tailMap(info.getRegionName()).values()) {
-      if (!node.getTable().equals(info.getTable())
-          || !ServerRegionReplicaUtil.isReplicasForSameRegion(info, node.getRegionInfo())) {
-        break;
-      } else if (!RegionReplicaUtil.isDefaultReplica(node.getRegionInfo())) {
-        // we have replicas
-        return true;
-      }
-    }
-    // we don have replicas
-    return false;
   }
 
   public ServerStateNode removeRegionFromServer(final ServerName serverName,

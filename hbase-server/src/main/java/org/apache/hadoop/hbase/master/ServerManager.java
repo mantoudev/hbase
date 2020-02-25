@@ -54,6 +54,8 @@ import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.ipc.HBaseRpcController;
 import org.apache.hadoop.hbase.master.assignment.RegionStates;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
+import org.apache.hadoop.hbase.procedure2.Procedure;
+import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.FutureUtils;
@@ -130,6 +132,8 @@ public class ServerManager {
   public static final int FLUSHEDSEQUENCEID_FLUSHER_INTERVAL_DEFAULT =
       3 * 60 * 60 * 1000; // 3 hours
 
+  public static final String MAX_CLOCK_SKEW_MS = "hbase.master.maxclockskew";
+
   private static final Logger LOG = LoggerFactory.getLogger(ServerManager.class);
 
   // Set if we are to shutdown the cluster.
@@ -177,7 +181,7 @@ public class ServerManager {
   public ServerManager(final MasterServices master) {
     this.master = master;
     Configuration c = master.getConfiguration();
-    maxSkew = c.getLong("hbase.master.maxclockskew", 30000);
+    maxSkew = c.getLong(MAX_CLOCK_SKEW_MS, 30000);
     warningSkew = c.getLong("hbase.master.warningclockskew", 10000);
     persistFlushedSequenceId = c.getBoolean(PERSIST_FLUSHEDSEQUENCEID,
         PERSIST_FLUSHEDSEQUENCEID_DEFAULT);
@@ -343,7 +347,7 @@ public class ServerManager {
    */
   void findDeadServersAndProcess(Set<ServerName> deadServersFromPE,
       Set<ServerName> liveServersFromWALDir) {
-    deadServersFromPE.forEach(deadservers::add);
+    deadServersFromPE.forEach(deadservers::putIfAbsent);
     liveServersFromWALDir.stream().filter(sn -> !onlineServers.containsKey(sn))
       .forEach(this::expireServer);
   }
@@ -374,6 +378,8 @@ public class ServerManager {
   }
 
   /**
+   * Called when RegionServer first reports in for duty and thereafter each
+   * time it heartbeats to make sure it is has not been figured for dead.
    * If this server is on the dead list, reject it with a YouAreDeadException.
    * If it was dead but came back with a new start code, remove the old entry
    * from the dead list.
@@ -382,21 +388,20 @@ public class ServerManager {
   private void checkIsDead(final ServerName serverName, final String what)
       throws YouAreDeadException {
     if (this.deadservers.isDeadServer(serverName)) {
-      // host name, port and start code all match with existing one of the
-      // dead servers. So, this server must be dead.
+      // Exact match: host name, port and start code all match with existing one of the
+      // dead servers. So, this server must be dead. Tell it to kill itself.
       String message = "Server " + what + " rejected; currently processing " +
           serverName + " as dead server";
       LOG.debug(message);
       throw new YouAreDeadException(message);
     }
-    // remove dead server with same hostname and port of newly checking in rs after master
-    // initialization.See HBASE-5916 for more information.
-    if ((this.master == null || this.master.isInitialized())
-        && this.deadservers.cleanPreviousInstance(serverName)) {
+    // Remove dead server with same hostname and port of newly checking in rs after master
+    // initialization. See HBASE-5916 for more information.
+    if ((this.master == null || this.master.isInitialized()) &&
+        this.deadservers.cleanPreviousInstance(serverName)) {
       // This server has now become alive after we marked it as dead.
       // We removed it's previous entry from the dead list to reflect it.
-      LOG.debug(what + ":" + " Server " + serverName + " came back up," +
-          " removed it from the dead servers list");
+      LOG.debug("{} {} came back up, removed it from the dead servers list", what, serverName);
     }
   }
 
@@ -559,22 +564,28 @@ public class ServerManager {
 
   /**
    * Expire the passed server. Add it to list of dead servers and queue a shutdown processing.
-   * @return True if we queued a ServerCrashProcedure else false if we did not (could happen for
-   *         many reasons including the fact that its this server that is going down or we already
-   *         have queued an SCP for this server or SCP processing is currently disabled because we
-   *         are in startup phase).
+   * @return pid if we queued a ServerCrashProcedure else {@link Procedure#NO_PROC_ID} if we did
+   *         not (could happen for many reasons including the fact that its this server that is
+   *         going down or we already have queued an SCP for this server or SCP processing is
+   *         currently disabled because we are in startup phase).
    */
-  public synchronized boolean expireServer(final ServerName serverName) {
+  @VisibleForTesting // Redo test so we can make this protected.
+  public synchronized long expireServer(final ServerName serverName) {
+    return expireServer(serverName, false);
+
+  }
+
+  synchronized long expireServer(final ServerName serverName, boolean force) {
     // THIS server is going down... can't handle our own expiration.
     if (serverName.equals(master.getServerName())) {
       if (!(master.isAborted() || master.isStopped())) {
         master.stop("We lost our znode?");
       }
-      return false;
+      return Procedure.NO_PROC_ID;
     }
     if (this.deadservers.isDeadServer(serverName)) {
-      LOG.warn("Expiration called on {} but crash processing already in progress", serverName);
-      return false;
+      LOG.warn("Expiration called on {} but already in DeadServer", serverName);
+      return Procedure.NO_PROC_ID;
     }
     moveFromOnlineToDeadServers(serverName);
 
@@ -586,40 +597,42 @@ public class ServerManager {
       if (this.onlineServers.isEmpty()) {
         master.stop("Cluster shutdown set; onlineServer=0");
       }
-      return false;
+      return Procedure.NO_PROC_ID;
     }
     LOG.info("Processing expiration of " + serverName + " on " + this.master.getServerName());
-    long pid = master.getAssignmentManager().submitServerCrash(serverName, true);
-    if(pid <= 0) {
-      return false;
-    } else {
-      // Tell our listeners that a server was removed
-      if (!this.listeners.isEmpty()) {
-        for (ServerListener listener : this.listeners) {
-          listener.serverRemoved(serverName);
-        }
-      }
-      // trigger a persist of flushedSeqId
-      if (flushedSeqIdFlusher != null) {
-        flushedSeqIdFlusher.triggerNow();
-      }
-      return true;
+    long pid = master.getAssignmentManager().submitServerCrash(serverName, true, force);
+    // Tell our listeners that a server was removed
+    if (!this.listeners.isEmpty()) {
+      this.listeners.stream().forEach(l -> l.serverRemoved(serverName));
     }
+    // trigger a persist of flushedSeqId
+    if (flushedSeqIdFlusher != null) {
+      flushedSeqIdFlusher.triggerNow();
+    }
+    return pid;
   }
 
-  // Note: this is currently invoked from RPC, not just tests. Locking in this class needs cleanup.
+  /**
+   * Called when server has expired.
+   */
+  // Locking in this class needs cleanup.
   @VisibleForTesting
   public synchronized void moveFromOnlineToDeadServers(final ServerName sn) {
-    synchronized (onlineServers) {
-      if (!this.onlineServers.containsKey(sn)) {
+    synchronized (this.onlineServers) {
+      boolean online = this.onlineServers.containsKey(sn);
+      if (online) {
+        // Remove the server from the known servers lists and update load info BUT
+        // add to deadservers first; do this so it'll show in dead servers list if
+        // not in online servers list.
+        this.deadservers.putIfAbsent(sn);
+        this.onlineServers.remove(sn);
+        onlineServers.notifyAll();
+      } else {
+        // If not online, that is odd but may happen if 'Unknown Servers' -- where meta
+        // has references to servers not online nor in dead servers list. If
+        // 'Unknown Server', don't add to DeadServers else will be there for ever.
         LOG.trace("Expiration of {} but server not online", sn);
       }
-      // Remove the server from the known servers lists and update load info BUT
-      // add to deadservers first; do this so it'll show in dead servers list if
-      // not in online servers list.
-      this.deadservers.add(sn);
-      this.onlineServers.remove(sn);
-      onlineServers.notifyAll();
     }
   }
 
@@ -664,8 +677,9 @@ public class ServerManager {
   }
 
   /**
-   * Contacts a region server and waits up to timeout ms to close the region. This bypasses the
-   * active hmaster.
+   * Contacts a region server and waits up to timeout ms
+   * to close the region.  This bypasses the active hmaster.
+   * Pass -1 as timeout if you do not want to wait on result.
    */
   public static void closeRegionSilentlyAndWait(AsyncClusterConnection connection,
       ServerName server, RegionInfo region, long timeout) throws IOException, InterruptedException {
@@ -675,6 +689,9 @@ public class ServerManager {
         admin.closeRegion(ProtobufUtil.buildCloseRegionRequest(server, region.getRegionName())));
     } catch (IOException e) {
       LOG.warn("Exception when closing region: " + region.getRegionNameAsString(), e);
+    }
+    if (timeout < 0) {
+      return;
     }
     long expiration = timeout + System.currentTimeMillis();
     while (System.currentTimeMillis() < expiration) {
@@ -865,7 +882,7 @@ public class ServerManager {
   /**
    * Check if a server is known to be dead.  A server can be online,
    * or known to be dead, or unknown to this manager (i.e, not online,
-   * not known to be dead either. it is simply not tracked by the
+   * not known to be dead either; it is simply not tracked by the
    * master any more, for example, a very old previous instance).
    */
   public synchronized boolean isServerDead(ServerName serverName) {

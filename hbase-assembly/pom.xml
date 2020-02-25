@@ -76,7 +76,7 @@
           <finalName>hbase-${project.version}</finalName>
           <skipAssembly>false</skipAssembly>
           <appendAssemblyId>true</appendAssemblyId>
-          <tarLongFileMode>gnu</tarLongFileMode>
+          <tarLongFileMode>posix</tarLongFileMode>
           <descriptors>
             <descriptor>${assembly.file}</descriptor>
             <descriptor>src/main/assembly/client.xml</descriptor>
@@ -308,6 +308,10 @@
     <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-zookeeper</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-hbtop</artifactId>
     </dependency>
     <dependency>
       <groupId>jline</groupId>

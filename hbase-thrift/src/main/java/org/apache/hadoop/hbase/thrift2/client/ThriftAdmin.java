@@ -140,6 +140,11 @@ public class ThriftAdmin implements Admin {
   }
 
   @Override
+  public List<TableDescriptor> listTableDescriptors(boolean includeSysTables) throws IOException {
+    return listTableDescriptors(null, includeSysTables);
+  }
+
+  @Override
   public List<TableDescriptor> listTableDescriptors(Pattern pattern) throws IOException {
     return listTableDescriptors(pattern, false);
   }
@@ -1140,6 +1145,16 @@ public class ThriftAdmin implements Admin {
   @Override
   public List<Boolean> hasUserPermissions(String userName, List<Permission> permissions) {
     throw new NotImplementedException("hasUserPermissions not supported in ThriftAdmin");
+  }
+
+  @Override
+  public boolean snapshotCleanupSwitch(boolean on, boolean synchronous) {
+    throw new NotImplementedException("snapshotCleanupSwitch not supported in ThriftAdmin");
+  }
+
+  @Override
+  public boolean isSnapshotCleanupEnabled() {
+    throw new NotImplementedException("isSnapshotCleanupEnabled not supported in ThriftAdmin");
   }
 
   @Override

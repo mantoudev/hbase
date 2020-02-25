@@ -87,13 +87,15 @@ public class TestExportSnapshot {
   public static void setUpBaseConf(Configuration conf) {
     conf.setBoolean(SnapshotManager.HBASE_SNAPSHOT_ENABLED, true);
     conf.setInt("hbase.regionserver.msginterval", 100);
+    // If a single node has enough failures (default 3), resource manager will blacklist it.
+    // With only 2 nodes and tests injecting faults, we don't want that.
+    conf.setInt("mapreduce.job.maxtaskfailures.per.tracker", 100);
+    /*
     conf.setInt("hbase.client.pause", 250);
     conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 6);
     conf.setBoolean("hbase.master.enabletable.roundrobin", true);
     conf.setInt("mapreduce.map.maxattempts", 10);
-    // If a single node has enough failures (default 3), resource manager will blacklist it.
-    // With only 2 nodes and tests injecting faults, we don't want that.
-    conf.setInt("mapreduce.job.maxtaskfailures.per.tracker", 100);
+    */
   }
 
   @BeforeClass
@@ -212,9 +214,9 @@ public class TestExportSnapshot {
       final Path sourceDir, Path copyDir, final boolean overwrite,
       final RegionPredicate bypassregionPredicate, boolean success) throws Exception {
     URI hdfsUri = FileSystem.get(conf).getUri();
-    FileSystem fs = FileSystem.get(copyDir.toUri(), new Configuration());
-    copyDir = copyDir.makeQualified(fs);
-
+    FileSystem fs = FileSystem.get(copyDir.toUri(), conf);
+    LOG.info("DEBUG FS {} {} {}, hdfsUri={}", fs, copyDir, copyDir.toUri(), hdfsUri);
+    copyDir = copyDir.makeQualified(fs.getUri(), fs.getWorkingDirectory());
     List<String> opts = new ArrayList<>();
     opts.add("--snapshot");
     opts.add(snapshotName);
@@ -228,29 +230,31 @@ public class TestExportSnapshot {
 
     // Export Snapshot
     int res = run(conf, new ExportSnapshot(), opts.toArray(new String[opts.size()]));
-    assertEquals(success ? 0 : 1, res);
+    assertEquals("success " + success + ", res=" + res, success ? 0 : 1, res);
     if (!success) {
       final Path targetDir = new Path(HConstants.SNAPSHOT_DIR_NAME, targetName);
-      assertFalse(fs.exists(new Path(copyDir, targetDir)));
+      assertFalse(copyDir.toString() + " " + targetDir.toString(),
+        fs.exists(new Path(copyDir, targetDir)));
       return;
     }
+    LOG.info("Exported snapshot");
 
     // Verify File-System state
     FileStatus[] rootFiles = fs.listStatus(copyDir);
     assertEquals(filesExpected > 0 ? 2 : 1, rootFiles.length);
     for (FileStatus fileStatus: rootFiles) {
       String name = fileStatus.getPath().getName();
-      assertTrue(fileStatus.isDirectory());
-      assertTrue(name.equals(HConstants.SNAPSHOT_DIR_NAME) ||
-                 name.equals(HConstants.HFILE_ARCHIVE_DIRECTORY));
+      assertTrue(fileStatus.toString(), fileStatus.isDirectory());
+      assertTrue(name.toString(), name.equals(HConstants.SNAPSHOT_DIR_NAME) ||
+        name.equals(HConstants.HFILE_ARCHIVE_DIRECTORY));
     }
+    LOG.info("Verified filesystem state");
 
-    // compare the snapshot metadata and verify the hfiles
+    // Compare the snapshot metadata and verify the hfiles
     final FileSystem hdfs = FileSystem.get(hdfsUri, conf);
     final Path snapshotDir = new Path(HConstants.SNAPSHOT_DIR_NAME, snapshotName);
     final Path targetDir = new Path(HConstants.SNAPSHOT_DIR_NAME, targetName);
-    verifySnapshotDir(hdfs, new Path(sourceDir, snapshotDir),
-        fs, new Path(copyDir, targetDir));
+    verifySnapshotDir(hdfs, new Path(sourceDir, snapshotDir), fs, new Path(copyDir, targetDir));
     Set<String> snapshotFiles = verifySnapshot(conf, fs, copyDir, tableName,
       targetName, bypassregionPredicate);
     assertEquals(filesExpected, snapshotFiles.size());
@@ -347,7 +351,8 @@ public class TestExportSnapshot {
   private static Set<String> listFiles(final FileSystem fs, final Path root, final Path dir)
       throws IOException {
     Set<String> files = new HashSet<>();
-    int rootPrefix = root.makeQualified(fs).toString().length();
+    LOG.debug("List files in {} in root {} at {}", fs, root, dir);
+    int rootPrefix = root.makeQualified(fs.getUri(), root).toString().length();
     FileStatus[] list = FSUtils.listStatus(fs, dir);
     if (list != null) {
       for (FileStatus fstat: list) {

@@ -28,7 +28,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
@@ -46,8 +45,8 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandlerImpl;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.testclassification.RPCTests;
-import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdge;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
@@ -60,18 +59,16 @@ import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.hbase.thirdparty.com.google.common.collect.ImmutableList;
 import org.apache.hbase.thirdparty.com.google.common.collect.ImmutableMap;
 import org.apache.hbase.thirdparty.com.google.common.collect.ImmutableSet;
 import org.apache.hbase.thirdparty.com.google.common.collect.Maps;
-
 import org.apache.hadoop.hbase.shaded.protobuf.RequestConverter;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ScanRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.RequestHeader;
 
-@Category({RPCTests.class, SmallTests.class})
+@Category({RPCTests.class, MediumTests.class})
 public class TestSimpleRpcScheduler {
 
   @ClassRule
@@ -115,17 +112,20 @@ public class TestSimpleRpcScheduler {
 
       RpcExecutor rpcExecutor = (RpcExecutor)ExecutorField.get(scheduler);
 
-      Field handlerCountField = rpcExecutor.getClass().getSuperclass().getSuperclass().getDeclaredField("handlerCount");
+      Field handlerCountField = rpcExecutor.getClass().getSuperclass().getSuperclass().
+        getDeclaredField("handlerCount");
 
       handlerCountField.setAccessible(true);
       handlerCountField.set(rpcExecutor, 0);
 
-      Field numCallQueuesField = rpcExecutor.getClass().getSuperclass().getSuperclass().getDeclaredField("numCallQueues");
+      Field numCallQueuesField = rpcExecutor.getClass().getSuperclass().getSuperclass().
+        getDeclaredField("numCallQueues");
 
       numCallQueuesField.setAccessible(true);
       numCallQueuesField.set(rpcExecutor, 1);
 
-      Field currentQueueLimitField = rpcExecutor.getClass().getSuperclass().getSuperclass().getDeclaredField("currentQueueLimit");
+      Field currentQueueLimitField = rpcExecutor.getClass().getSuperclass().getSuperclass().
+        getDeclaredField("currentQueueLimit");
 
       currentQueueLimitField.setAccessible(true);
       currentQueueLimitField.set(rpcExecutor, 100);
@@ -480,14 +480,15 @@ public class TestSimpleRpcScheduler {
     }
   }
 
-  // FIX. I don't get this test (St.Ack). When I time this test, the minDelay is > 2 * codel delay from the get go.
-  // So we are always overloaded. The test below would seem to complete the queuing of all the CallRunners inside
-  // the codel check interval. I don't think we are skipping codel checking. Second, I think this test has been
-  // broken since HBASE-16089 Add on FastPath for CoDel went in. The thread name we were looking for was the name
-  // BEFORE we updated: i.e. "RpcServer.CodelBQ.default.handler". But same patch changed the name of the codel
-  // fastpath thread to: new FastPathBalancedQueueRpcExecutor("CodelFPBQ.default", handlerCount, numCallQueues...
-  // Codel is hard to test. This test is going to be flakey given it all timer-based. Disabling for now till chat
-  // with authors.
+  // FIX. I don't get this test (St.Ack). When I time this test, the minDelay is > 2 * codel delay
+  // from the get go. So we are always overloaded. The test below would seem to complete the
+  // queuing of all the CallRunners inside the codel check interval. I don't think we are skipping
+  // codel checking. Second, I think this test has been broken since HBASE-16089 Add on FastPath for
+  // CoDel went in. The thread name we were looking for was the name BEFORE we updated: i.e.
+  // "RpcServer.CodelBQ.default.handler". But same patch changed the name of the codel fastpath
+  // thread to: new FastPathBalancedQueueRpcExecutor("CodelFPBQ.default", handlerCount,
+  // numCallQueues... Codel is hard to test. This test is going to be flakey given it all
+  // timer-based. Disabling for now till chat with authors.
   @Test
   public void testCoDelScheduling() throws Exception {
     CoDelEnvironmentEdge envEdge = new CoDelEnvironmentEdge();
@@ -501,8 +502,8 @@ public class TestSimpleRpcScheduler {
     SimpleRpcScheduler scheduler =
         new SimpleRpcScheduler(schedConf, 1, 1, 1, priority, HConstants.QOS_THRESHOLD);
     try {
-      // Loading mocked call runner can take a good amount of time the first time through (haven't looked why).
-      // Load it for first time here outside of the timed loop.
+      // Loading mocked call runner can take a good amount of time the first time through
+      // (haven't looked why). Load it for first time here outside of the timed loop.
       getMockedCallRunner(System.currentTimeMillis(), 2);
       scheduler.start();
       EnvironmentEdgeManager.injectEdge(envEdge);
@@ -559,6 +560,75 @@ public class TestSimpleRpcScheduler {
     }
   }
 
+  @Test
+  public void testMetaRWScanQueues() throws Exception {
+    Configuration schedConf = HBaseConfiguration.create();
+    schedConf.setFloat(RpcExecutor.CALL_QUEUE_HANDLER_FACTOR_CONF_KEY, 1.0f);
+    schedConf.setFloat(MetaRWQueueRpcExecutor.META_CALL_QUEUE_READ_SHARE_CONF_KEY, 0.7f);
+    schedConf.setFloat(MetaRWQueueRpcExecutor.META_CALL_QUEUE_SCAN_SHARE_CONF_KEY, 0.5f);
+
+    PriorityFunction priority = mock(PriorityFunction.class);
+    when(priority.getPriority(any(), any(), any())).thenReturn(HConstants.HIGH_QOS);
+
+    RpcScheduler scheduler = new SimpleRpcScheduler(schedConf, 3, 3, 1, priority,
+        HConstants.QOS_THRESHOLD);
+    try {
+      scheduler.start();
+
+      CallRunner putCallTask = mock(CallRunner.class);
+      ServerCall putCall = mock(ServerCall.class);
+      putCall.param = RequestConverter.buildMutateRequest(
+          Bytes.toBytes("abc"), new Put(Bytes.toBytes("row")));
+      RequestHeader putHead = RequestHeader.newBuilder().setMethodName("mutate").build();
+      when(putCallTask.getRpcCall()).thenReturn(putCall);
+      when(putCall.getHeader()).thenReturn(putHead);
+      when(putCall.getParam()).thenReturn(putCall.param);
+
+      CallRunner getCallTask = mock(CallRunner.class);
+      ServerCall getCall = mock(ServerCall.class);
+      RequestHeader getHead = RequestHeader.newBuilder().setMethodName("get").build();
+      when(getCallTask.getRpcCall()).thenReturn(getCall);
+      when(getCall.getHeader()).thenReturn(getHead);
+
+      CallRunner scanCallTask = mock(CallRunner.class);
+      ServerCall scanCall = mock(ServerCall.class);
+      scanCall.param = ScanRequest.newBuilder().build();
+      RequestHeader scanHead = RequestHeader.newBuilder().setMethodName("scan").build();
+      when(scanCallTask.getRpcCall()).thenReturn(scanCall);
+      when(scanCall.getHeader()).thenReturn(scanHead);
+      when(scanCall.getParam()).thenReturn(scanCall.param);
+
+      ArrayList<Integer> work = new ArrayList<>();
+      doAnswerTaskExecution(putCallTask, work, 1, 1000);
+      doAnswerTaskExecution(getCallTask, work, 2, 1000);
+      doAnswerTaskExecution(scanCallTask, work, 3, 1000);
+
+      // There are 3 queues: [puts], [gets], [scans]
+      // so the calls will be interleaved
+      scheduler.dispatch(putCallTask);
+      scheduler.dispatch(putCallTask);
+      scheduler.dispatch(putCallTask);
+      scheduler.dispatch(getCallTask);
+      scheduler.dispatch(getCallTask);
+      scheduler.dispatch(getCallTask);
+      scheduler.dispatch(scanCallTask);
+      scheduler.dispatch(scanCallTask);
+      scheduler.dispatch(scanCallTask);
+
+      while (work.size() < 6) {
+        Thread.sleep(100);
+      }
+
+      for (int i = 0; i < work.size() - 2; i += 3) {
+        assertNotEquals(work.get(i + 0), work.get(i + 1));
+        assertNotEquals(work.get(i + 0), work.get(i + 2));
+        assertNotEquals(work.get(i + 1), work.get(i + 2));
+      }
+    } finally {
+      scheduler.stop();
+    }
+  }
+
   // Get mocked call that has the CallRunner sleep for a while so that the fast
   // path isn't hit.
   private CallRunner getMockedCallRunner(long timestamp, final long sleepTime) throws IOException {
@@ -575,7 +645,9 @@ public class TestSimpleRpcScheduler {
     CallRunner cr = new CallRunner(null, putCall) {
       @Override
       public void run() {
-        if (sleepTime <= 0) return;
+        if (sleepTime <= 0) {
+          return;
+        }
         try {
           LOG.warn("Sleeping for " + sleepTime);
           Thread.sleep(sleepTime);

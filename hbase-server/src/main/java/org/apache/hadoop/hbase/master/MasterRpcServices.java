@@ -1,5 +1,4 @@
-/**
- *
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,7 +18,7 @@
 package org.apache.hadoop.hbase.master;
 
 import static org.apache.hadoop.hbase.master.MasterWalManager.META_FILTER;
-
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.BindException;
 import java.net.InetAddress;
@@ -30,13 +29,16 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.ClusterMetricsBuilder;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.MetaTableAccessor;
 import org.apache.hadoop.hbase.NamespaceDescriptor;
 import org.apache.hadoop.hbase.Server;
@@ -45,8 +47,8 @@ import org.apache.hadoop.hbase.ServerMetricsBuilder;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.UnknownRegionException;
-import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
 import org.apache.hadoop.hbase.client.MasterSwitchType;
+import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.Table;
@@ -103,6 +105,7 @@ import org.apache.hadoop.hbase.security.access.PermissionStorage;
 import org.apache.hadoop.hbase.security.access.ShadedAccessControlUtil;
 import org.apache.hadoop.hbase.security.access.UserPermission;
 import org.apache.hadoop.hbase.security.visibility.VisibilityController;
+
 import org.apache.hadoop.hbase.snapshot.ClientSnapshotDescriptionUtils;
 import org.apache.hadoop.hbase.snapshot.SnapshotDescriptionUtils;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -111,15 +114,15 @@ import org.apache.hadoop.hbase.util.ForeignExceptionUtil;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;
 import org.apache.hadoop.hbase.zookeeper.MetaTableLocator;
+
+
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.hbase.thirdparty.com.google.protobuf.RpcController;
 import org.apache.hbase.thirdparty.com.google.protobuf.ServiceException;
 import org.apache.hbase.thirdparty.com.google.protobuf.UnsafeByteOperations;
-
 import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.shaded.protobuf.ResponseConverter;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AccessControlProtos;
@@ -160,6 +163,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.BalanceReq
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.BalanceResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ClearDeadServersRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ClearDeadServersResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ClientMetaService;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.CreateNamespaceRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.CreateNamespaceResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.CreateTableRequest;
@@ -184,18 +188,25 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ExecProced
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ExecProcedureResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.FixMetaRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.FixMetaResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetActiveMasterRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetActiveMasterResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetClusterIdRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetClusterIdResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetClusterStatusRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetClusterStatusResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetCompletedSnapshotsRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetCompletedSnapshotsResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetLocksRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetLocksResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetMetaRegionLocationsRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetMetaRegionLocationsResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetNamespaceDescriptorRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetNamespaceDescriptorResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetProcedureResultRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetProcedureResultResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetProceduresRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetProceduresResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetRegionStateInMetaResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetSchemaAlterStatusRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetSchemaAlterStatusResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetTableDescriptorsRequest;
@@ -219,6 +230,10 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsNormaliz
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsNormalizerEnabledResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsProcedureDoneRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsProcedureDoneResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos
+    .IsSnapshotCleanupEnabledRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos
+    .IsSnapshotCleanupEnabledResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsSnapshotDoneRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsSnapshotDoneResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsSplitOrMergeEnabledRequest;
@@ -271,6 +286,11 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetNormali
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetNormalizerRunningResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetQuotaRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetQuotaResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetRegionStateInMetaRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos
+    .SetSnapshotCleanupRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos
+    .SetSnapshotCleanupResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetSplitOrMergeEnabledRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetSplitOrMergeEnabledResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetTableStateInMetaRequest;
@@ -335,14 +355,17 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationProtos.Updat
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationProtos.UpdateReplicationPeerConfigResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.SnapshotProtos.SnapshotDescription;
 
+
+
 /**
  * Implements the master RPC services.
  */
 @InterfaceAudience.Private
 @SuppressWarnings("deprecation")
-public class MasterRpcServices extends RSRpcServices
-      implements MasterService.BlockingInterface, RegionServerStatusService.BlockingInterface,
-        LockService.BlockingInterface, HbckService.BlockingInterface {
+public class MasterRpcServices extends RSRpcServices implements
+    MasterService.BlockingInterface, RegionServerStatusService.BlockingInterface,
+    LockService.BlockingInterface, HbckService.BlockingInterface,
+    ClientMetaService.BlockingInterface {
   private static final Logger LOG = LoggerFactory.getLogger(MasterRpcServices.class.getName());
   private static final Logger AUDITLOG =
       LoggerFactory.getLogger("SecurityLogger."+MasterRpcServices.class.getName());
@@ -351,7 +374,7 @@ public class MasterRpcServices extends RSRpcServices
 
   /**
    * @return Subset of configuration to pass initializing regionservers: e.g.
-   * the filesystem to use and root directory to use.
+   *     the filesystem to use and root directory to use.
    */
   private RegionServerStartupResponse.Builder createConfigurationSubset() {
     RegionServerStartupResponse.Builder resp = addConfig(
@@ -385,9 +408,10 @@ public class MasterRpcServices extends RSRpcServices
   }
 
   @Override
-  protected RpcServerInterface createRpcServer(Server server, Configuration conf,
-      RpcSchedulerFactory rpcSchedulerFactory, InetSocketAddress bindAddress, String name)
-      throws IOException {
+  protected RpcServerInterface createRpcServer(final Server server,
+      final RpcSchedulerFactory rpcSchedulerFactory, final InetSocketAddress bindAddress,
+      final String name) throws IOException {
+    final Configuration conf = regionServer.getConfiguration();
     // RpcServer at HM by default enable ByteBufferPool iff HM having user table region in it
     boolean reservoirEnabled = conf.getBoolean(ByteBuffAllocator.ALLOCATOR_POOL_ENABLED_KEY,
       LoadBalancer.isMasterCanHostUserRegions(conf));
@@ -476,15 +500,17 @@ public class MasterRpcServices extends RSRpcServices
   protected List<BlockingServiceAndInterface> getServices() {
     List<BlockingServiceAndInterface> bssi = new ArrayList<>(5);
     bssi.add(new BlockingServiceAndInterface(
-      MasterService.newReflectiveBlockingService(this),
-      MasterService.BlockingInterface.class));
+        MasterService.newReflectiveBlockingService(this),
+        MasterService.BlockingInterface.class));
     bssi.add(new BlockingServiceAndInterface(
-      RegionServerStatusService.newReflectiveBlockingService(this),
-      RegionServerStatusService.BlockingInterface.class));
+        RegionServerStatusService.newReflectiveBlockingService(this),
+        RegionServerStatusService.BlockingInterface.class));
     bssi.add(new BlockingServiceAndInterface(LockService.newReflectiveBlockingService(this),
         LockService.BlockingInterface.class));
     bssi.add(new BlockingServiceAndInterface(HbckService.newReflectiveBlockingService(this),
         HbckService.BlockingInterface.class));
+    bssi.add(new BlockingServiceAndInterface(ClientMetaService.newReflectiveBlockingService(this),
+        ClientMetaService.BlockingInterface.class));
     bssi.addAll(super.getServices());
     return bssi;
   }
@@ -611,7 +637,9 @@ public class MasterRpcServices extends RSRpcServices
 
       final byte[] regionName = req.getRegion().getValue().toByteArray();
       final RegionInfo regionInfo = master.getAssignmentManager().getRegionInfo(regionName);
-      if (regionInfo == null) throw new UnknownRegionException(Bytes.toStringBinary(regionName));
+      if (regionInfo == null) {
+        throw new UnknownRegionException(Bytes.toStringBinary(regionName));
+      }
 
       final AssignRegionResponse arr = AssignRegionResponse.newBuilder().build();
       if (master.cpHost != null) {
@@ -656,7 +684,7 @@ public class MasterRpcServices extends RSRpcServices
 
   @Override
   public CreateTableResponse createTable(RpcController controller, CreateTableRequest req)
-  throws ServiceException {
+      throws ServiceException {
     TableDescriptor tableDescriptor = ProtobufUtil.toTableDescriptor(req.getTableSchema());
     byte [][] splitKeys = ProtobufUtil.getSplitKeysArray(req);
     try {
@@ -812,10 +840,6 @@ public class MasterRpcServices extends RSRpcServices
 
     RegionStates regionStates = master.getAssignmentManager().getRegionStates();
 
-    if (request.getRegionCount() != 2) {
-      throw new ServiceException(new DoNotRetryIOException(
-        "Only support merging 2 regions but " + request.getRegionCount() + " region passed"));
-    }
     RegionInfo[] regionsToMerge = new RegionInfo[request.getRegionCount()];
     for (int i = 0; i < request.getRegionCount(); i++) {
       final byte[] encodedNameOfRegion = request.getRegion(i).getValue().toByteArray();
@@ -964,7 +988,10 @@ public class MasterRpcServices extends RSRpcServices
       GetClusterStatusRequest req) throws ServiceException {
     GetClusterStatusResponse.Builder response = GetClusterStatusResponse.newBuilder();
     try {
-      master.checkInitialized();
+      // We used to check if Master was up at this point but let this call proceed even if
+      // Master is initializing... else we shut out stuff like hbck2 tool from making progress
+      // since it queries this method to figure cluster version. hbck2 wants to be able to work
+      // against Master even if it is 'initializing' so it can do fixup.
       response.setClusterStatus(ClusterMetricsBuilder.toClusterStatus(
         master.getClusterMetrics(ClusterMetricsBuilder.toOptions(req.getOptionsList()))));
     } catch (IOException e) {
@@ -1054,7 +1081,7 @@ public class MasterRpcServices extends RSRpcServices
    * Get list of TableDescriptors for requested tables.
    * @param c Unused (set to null).
    * @param req GetTableDescriptorsRequest that contains:
-   * - tableNames: requested tables, or if empty, all are requested
+   *     - tableNames: requested tables, or if empty, all are requested.
    * @return GetTableDescriptorsResponse
    * @throws ServiceException
    */
@@ -1198,9 +1225,9 @@ public class MasterRpcServices extends RSRpcServices
   /**
    * Checks if the specified snapshot is done.
    * @return true if the snapshot is in file system ready to use,
-   *   false if the snapshot is in the process of completing
+   *     false if the snapshot is in the process of completing
    * @throws ServiceException wrapping UnknownSnapshotException if invalid snapshot, or
-   *  a wrapped HBaseSnapshotException with progress failure reason.
+   *     a wrapped HBaseSnapshotException with progress failure reason.
    */
   @Override
   public IsSnapshotDoneResponse isSnapshotDone(RpcController controller,
@@ -1442,7 +1469,9 @@ public class MasterRpcServices extends RSRpcServices
 
       final byte[] regionName = request.getRegion().getValue().toByteArray();
       final RegionInfo hri = master.getAssignmentManager().getRegionInfo(regionName);
-      if (hri == null) throw new UnknownRegionException(Bytes.toStringBinary(regionName));
+      if (hri == null) {
+        throw new UnknownRegionException(Bytes.toStringBinary(regionName));
+      }
 
       if (master.cpHost != null) {
         master.cpHost.preRegionOffline(hri);
@@ -1484,6 +1513,55 @@ public class MasterRpcServices extends RSRpcServices
       throw new ServiceException(e);
     }
   }
+
+  @Override
+  public SetSnapshotCleanupResponse switchSnapshotCleanup(
+      RpcController controller, SetSnapshotCleanupRequest request)
+      throws ServiceException {
+    try {
+      master.checkInitialized();
+      final boolean enabled = request.getEnabled();
+      final boolean isSynchronous = request.hasSynchronous() && request.getSynchronous();
+      final boolean prevSnapshotCleanupRunning = this.switchSnapshotCleanup(enabled, isSynchronous);
+      return SetSnapshotCleanupResponse.newBuilder()
+          .setPrevSnapshotCleanup(prevSnapshotCleanupRunning).build();
+    } catch (IOException e) {
+      throw new ServiceException(e);
+    }
+  }
+
+  @Override
+  public IsSnapshotCleanupEnabledResponse isSnapshotCleanupEnabled(
+      RpcController controller, IsSnapshotCleanupEnabledRequest request)
+      throws ServiceException {
+    try {
+      master.checkInitialized();
+      final boolean isSnapshotCleanupEnabled = master.snapshotCleanupTracker
+          .isSnapshotCleanupEnabled();
+      return IsSnapshotCleanupEnabledResponse.newBuilder()
+          .setEnabled(isSnapshotCleanupEnabled).build();
+    } catch (IOException e) {
+      throw new ServiceException(e);
+    }
+  }
+
+  /**
+   * Turn on/off snapshot auto-cleanup based on TTL
+   *
+   * @param enabledNewVal Set to <code>true</code> to enable, <code>false</code> to disable
+   * @param synchronous If <code>true</code>, it waits until current snapshot cleanup is completed,
+   *   if outstanding
+   * @return previous snapshot auto-cleanup mode
+   */
+  private synchronized boolean switchSnapshotCleanup(final boolean enabledNewVal,
+    final boolean synchronous) {
+    final boolean oldValue = master.snapshotCleanupTracker.isSnapshotCleanupEnabled();
+    master.switchSnapshotCleanup(enabledNewVal, synchronous);
+    LOG.info("{} Successfully set snapshot cleanup to {}", master.getClientIdAuditPrefix(),
+      enabledNewVal);
+    return oldValue;
+  }
+
 
   @Override
   public RunCatalogScanResponse runCatalogScan(RpcController c,
@@ -1691,10 +1769,15 @@ public class MasterRpcServices extends RSRpcServices
       master.checkInitialized();
       byte[] regionName = request.getRegion().getValue().toByteArray();
       TableName tableName = RegionInfo.getTable(regionName);
+      // TODO: support CompactType.MOB
       // if the region is a mob region, do the mob file compaction.
       if (MobUtils.isMobRegionName(tableName, regionName)) {
         checkHFileFormatVersionForMob();
-        return compactMob(request, tableName);
+        //TODO: support CompactType.MOB
+        // HBASE-23571
+        LOG.warn("CompactType.MOB is not supported yet, will run regular compaction."+
+            " Refer to HBASE-23571.");
+        return super.compactRegion(controller, request);
       } else {
         return super.compactRegion(controller, request);
       }
@@ -1717,77 +1800,46 @@ public class MasterRpcServices extends RSRpcServices
     }
   }
 
+  /**
+   * This method implements Admin getRegionInfo. On RegionServer, it is
+   * able to return RegionInfo and detail. On Master, it just returns
+   * RegionInfo. On Master it has been hijacked to return Mob detail.
+   * Master implementation is good for querying full region name if
+   * you only have the encoded name (useful around region replicas
+   * for example which do not have a row in hbase:meta).
+   */
   @Override
   @QosPriority(priority=HConstants.ADMIN_QOS)
   public GetRegionInfoResponse getRegionInfo(final RpcController controller,
     final GetRegionInfoRequest request) throws ServiceException {
-    byte[] regionName = request.getRegion().getValue().toByteArray();
-    TableName tableName = RegionInfo.getTable(regionName);
-    if (MobUtils.isMobRegionName(tableName, regionName)) {
-      // a dummy region info contains the compaction state.
-      RegionInfo mobRegionInfo = MobUtils.getMobRegionInfo(tableName);
-      GetRegionInfoResponse.Builder builder = GetRegionInfoResponse.newBuilder();
-      builder.setRegionInfo(ProtobufUtil.toRegionInfo(mobRegionInfo));
-      if (request.hasCompactionState() && request.getCompactionState()) {
-        builder.setCompactionState(master.getMobCompactionState(tableName));
-      }
-      return builder.build();
-    } else {
-      return super.getRegionInfo(controller, request);
+    RegionInfo ri = null;
+    try {
+      ri = getRegionInfo(request.getRegion());
+    } catch(UnknownRegionException ure) {
+      throw new ServiceException(ure);
     }
+    GetRegionInfoResponse.Builder builder = GetRegionInfoResponse.newBuilder();
+    if (ri != null) {
+      builder.setRegionInfo(ProtobufUtil.toRegionInfo(ri));
+    } else {
+      // Is it a MOB name? These work differently.
+      byte [] regionName = request.getRegion().getValue().toByteArray();
+      TableName tableName = RegionInfo.getTable(regionName);
+      if (MobUtils.isMobRegionName(tableName, regionName)) {
+        // a dummy region info contains the compaction state.
+        RegionInfo mobRegionInfo = MobUtils.getMobRegionInfo(tableName);
+        builder.setRegionInfo(ProtobufUtil.toRegionInfo(mobRegionInfo));
+        if (request.hasCompactionState() && request.getCompactionState()) {
+          builder.setCompactionState(master.getMobCompactionState(tableName));
+        }
+      } else {
+        // If unknown RegionInfo and not a MOB region, it is unknown.
+        throw new ServiceException(new UnknownRegionException(Bytes.toString(regionName)));
+      }
+    }
+    return builder.build();
   }
 
-  /**
-   * Compacts the mob files in the current table.
-   * @param request the request.
-   * @param tableName the current table name.
-   * @return The response of the mob file compaction.
-   * @throws IOException
-   */
-  private CompactRegionResponse compactMob(final CompactRegionRequest request,
-    TableName tableName) throws IOException {
-    if (!master.getTableStateManager().isTableState(tableName, TableState.State.ENABLED)) {
-      throw new DoNotRetryIOException("Table " + tableName + " is not enabled");
-    }
-    boolean allFiles = false;
-    List<ColumnFamilyDescriptor> compactedColumns = new ArrayList<>();
-    ColumnFamilyDescriptor[] hcds = master.getTableDescriptors().get(tableName).getColumnFamilies();
-    byte[] family = null;
-    if (request.hasFamily()) {
-      family = request.getFamily().toByteArray();
-      for (ColumnFamilyDescriptor hcd : hcds) {
-        if (Bytes.equals(family, hcd.getName())) {
-          if (!hcd.isMobEnabled()) {
-            LOG.error("Column family " + hcd.getNameAsString() + " is not a mob column family");
-            throw new DoNotRetryIOException("Column family " + hcd.getNameAsString()
-                    + " is not a mob column family");
-          }
-          compactedColumns.add(hcd);
-        }
-      }
-    } else {
-      for (ColumnFamilyDescriptor hcd : hcds) {
-        if (hcd.isMobEnabled()) {
-          compactedColumns.add(hcd);
-        }
-      }
-    }
-    if (compactedColumns.isEmpty()) {
-      LOG.error("No mob column families are assigned in the mob compaction");
-      throw new DoNotRetryIOException(
-              "No mob column families are assigned in the mob compaction");
-    }
-    if (request.hasMajor() && request.getMajor()) {
-      allFiles = true;
-    }
-    String familyLogMsg = (family != null) ? Bytes.toString(family) : "";
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("User-triggered mob compaction requested for table: "
-              + tableName.getNameAsString() + " for column family: " + familyLogMsg);
-    }
-    master.requestMobCompaction(tableName, compactedColumns, allFiles);
-    return CompactRegionResponse.newBuilder().build();
-  }
 
   @Override
   public IsBalancerEnabledResponse isBalancerEnabled(RpcController controller,
@@ -2227,10 +2279,15 @@ public class MasterRpcServices extends RSRpcServices
         return RegionSpaceUseReportResponse.newBuilder().build();
       }
       MasterQuotaManager quotaManager = this.master.getMasterQuotaManager();
-      final long now = EnvironmentEdgeManager.currentTime();
-      for (RegionSpaceUse report : request.getSpaceUseList()) {
-        quotaManager.addRegionSize(ProtobufUtil.toRegionInfo(
-            report.getRegionInfo()), report.getRegionSize(), now);
+      if (quotaManager != null) {
+        final long now = EnvironmentEdgeManager.currentTime();
+        for (RegionSpaceUse report : request.getSpaceUseList()) {
+          quotaManager.addRegionSize(ProtobufUtil.toRegionInfo(report.getRegionInfo()),
+            report.getRegionSize(), now);
+        }
+      } else {
+        LOG.debug("Received region space usage report but HMaster is not ready to process it, "
+            + "skipping");
       }
       return RegionSpaceUseReportResponse.newBuilder().build();
     } catch (Exception e) {
@@ -2265,6 +2322,9 @@ public class MasterRpcServices extends RSRpcServices
               .setSize(tableSize.getValue()).build());
         }
         return builder.build();
+      } else {
+        LOG.debug("Received space quota region size report but HMaster is not ready to process it,"
+            + "skipping");
       }
       return builder.build();
     } catch (Exception e) {
@@ -2403,6 +2463,42 @@ public class MasterRpcServices extends RSRpcServices
   }
 
   /**
+   * Update state of the region in meta only. This is required by hbck in some situations to cleanup
+   * stuck assign/ unassign regions procedures for the table.
+   *
+   * @return previous states of the regions
+   */
+  @Override
+  public GetRegionStateInMetaResponse setRegionStateInMeta(RpcController controller,
+    SetRegionStateInMetaRequest request) throws ServiceException {
+    final GetRegionStateInMetaResponse.Builder builder = GetRegionStateInMetaResponse.newBuilder();
+    for(ClusterStatusProtos.RegionState s : request.getStatesList()) {
+      try {
+        RegionInfo info = this.master.getAssignmentManager().
+          loadRegionFromMeta(s.getRegionInfo().getRegionEncodedName());
+        LOG.trace("region info loaded from meta table: {}", info);
+        RegionState prevState = this.master.getAssignmentManager().getRegionStates().
+          getRegionState(info);
+        RegionState newState = RegionState.convert(s);
+        LOG.info("{} set region={} state from {} to {}", master.getClientIdAuditPrefix(), info,
+          prevState.getState(), newState.getState());
+        Put metaPut = MetaTableAccessor.makePutFromRegionInfo(info, System.currentTimeMillis());
+        metaPut.addColumn(HConstants.CATALOG_FAMILY, HConstants.STATE_QUALIFIER,
+          Bytes.toBytes(newState.getState().name()));
+        List<Put> putList = new ArrayList<>();
+        putList.add(metaPut);
+        MetaTableAccessor.putsToMetaTable(this.master.getConnection(), putList);
+        //Loads from meta again to refresh AM cache with the new region state
+        this.master.getAssignmentManager().loadRegionFromMeta(info.getEncodedName());
+        builder.addStates(prevState.convert());
+      } catch (Exception e) {
+        throw new ServiceException(e);
+      }
+    }
+    return builder.build();
+  }
+
+  /**
    * Get RegionInfo from Master using content of RegionSpecifier as key.
    * @return RegionInfo found by decoding <code>rs</code> or null if none found
    */
@@ -2522,26 +2618,18 @@ public class MasterRpcServices extends RSRpcServices
   public MasterProtos.ScheduleServerCrashProcedureResponse scheduleServerCrashProcedure(
       RpcController controller, MasterProtos.ScheduleServerCrashProcedureRequest request)
       throws ServiceException {
-    List<HBaseProtos.ServerName> serverNames = request.getServerNameList();
     List<Long> pids = new ArrayList<>();
-    try {
-      for (HBaseProtos.ServerName serverName : serverNames) {
-        ServerName server = ProtobufUtil.toServerName(serverName);
-        LOG.info("{} schedule ServerCrashProcedure for {}",
-            master.getClientIdAuditPrefix(), server);
-        if (shouldSubmitSCP(server)) {
-          master.getServerManager().moveFromOnlineToDeadServers(server);
-          ProcedureExecutor<MasterProcedureEnv> procExec = this.master.getMasterProcedureExecutor();
-          pids.add(procExec.submitProcedure(new ServerCrashProcedure(procExec.getEnvironment(),
-            server, true, containMetaWals(server))));
-        } else {
-          pids.add(-1L);
-        }
+    for (HBaseProtos.ServerName sn: request.getServerNameList()) {
+      ServerName serverName = ProtobufUtil.toServerName(sn);
+      LOG.info("{} schedule ServerCrashProcedure for {}",
+          this.master.getClientIdAuditPrefix(), serverName);
+      if (shouldSubmitSCP(serverName)) {
+        pids.add(this.master.getServerManager().expireServer(serverName, true));
+      } else {
+        pids.add(Procedure.NO_PROC_ID);
       }
-      return MasterProtos.ScheduleServerCrashProcedureResponse.newBuilder().addAllPid(pids).build();
-    } catch (IOException e) {
-      throw new ServiceException(e);
     }
+    return MasterProtos.ScheduleServerCrashProcedureResponse.newBuilder().addAllPid(pids).build();
   }
 
   @Override
@@ -2593,27 +2681,29 @@ public class MasterRpcServices extends RSRpcServices
   public GrantResponse grant(RpcController controller, GrantRequest request)
       throws ServiceException {
     try {
-      final UserPermission perm =
-          ShadedAccessControlUtil.toUserPermission(request.getUserPermission());
-      boolean mergeExistingPermissions = request.getMergeExistingPermissions();
-      if (master.cpHost != null) {
+      master.checkInitialized();
+      if (master.cpHost != null && hasAccessControlServiceCoprocessor(master.cpHost)) {
+        final UserPermission perm =
+            ShadedAccessControlUtil.toUserPermission(request.getUserPermission());
+        boolean mergeExistingPermissions = request.getMergeExistingPermissions();
         master.cpHost.preGrant(perm, mergeExistingPermissions);
-      }
-      try (Table table = master.getConnection().getTable(PermissionStorage.ACL_TABLE_NAME)) {
-        PermissionStorage.addUserPermission(getConfiguration(), perm, table,
-          mergeExistingPermissions);
-      }
-      if (master.cpHost != null) {
+        try (Table table = master.getConnection().getTable(PermissionStorage.ACL_TABLE_NAME)) {
+          PermissionStorage.addUserPermission(getConfiguration(), perm, table,
+            mergeExistingPermissions);
+        }
         master.cpHost.postGrant(perm, mergeExistingPermissions);
+        User caller = RpcServer.getRequestUser().orElse(null);
+        if (AUDITLOG.isTraceEnabled()) {
+          // audit log should store permission changes in addition to auth results
+          String remoteAddress = RpcServer.getRemoteAddress().map(InetAddress::toString).orElse("");
+          AUDITLOG.trace("User {} (remote address: {}) granted permission {}", caller,
+            remoteAddress, perm);
+        }
+        return GrantResponse.getDefaultInstance();
+      } else {
+        throw new DoNotRetryIOException(
+            new UnsupportedOperationException(AccessController.class.getName() + " is not loaded"));
       }
-      User caller = RpcServer.getRequestUser().orElse(null);
-      if (AUDITLOG.isTraceEnabled()) {
-        // audit log should store permission changes in addition to auth results
-        String remoteAddress = RpcServer.getRemoteAddress().map(InetAddress::toString).orElse("");
-        AUDITLOG.trace("User {} (remote address: {}) granted permission {}", caller, remoteAddress,
-                perm);
-      }
-      return GrantResponse.getDefaultInstance();
     } catch (IOException ioe) {
       throw new ServiceException(ioe);
     }
@@ -2623,25 +2713,27 @@ public class MasterRpcServices extends RSRpcServices
   public RevokeResponse revoke(RpcController controller, RevokeRequest request)
       throws ServiceException {
     try {
-      final UserPermission userPermission =
-          ShadedAccessControlUtil.toUserPermission(request.getUserPermission());
-      if (master.cpHost != null) {
+      master.checkInitialized();
+      if (master.cpHost != null && hasAccessControlServiceCoprocessor(master.cpHost)) {
+        final UserPermission userPermission =
+            ShadedAccessControlUtil.toUserPermission(request.getUserPermission());
         master.cpHost.preRevoke(userPermission);
-      }
-      try (Table table = master.getConnection().getTable(PermissionStorage.ACL_TABLE_NAME)) {
-        PermissionStorage.removeUserPermission(master.getConfiguration(), userPermission, table);
-      }
-      if (master.cpHost != null) {
+        try (Table table = master.getConnection().getTable(PermissionStorage.ACL_TABLE_NAME)) {
+          PermissionStorage.removeUserPermission(master.getConfiguration(), userPermission, table);
+        }
         master.cpHost.postRevoke(userPermission);
+        User caller = RpcServer.getRequestUser().orElse(null);
+        if (AUDITLOG.isTraceEnabled()) {
+          // audit log should record all permission changes
+          String remoteAddress = RpcServer.getRemoteAddress().map(InetAddress::toString).orElse("");
+          AUDITLOG.trace("User {} (remote address: {}) revoked permission {}", caller,
+            remoteAddress, userPermission);
+        }
+        return RevokeResponse.getDefaultInstance();
+      } else {
+        throw new DoNotRetryIOException(
+            new UnsupportedOperationException(AccessController.class.getName() + " is not loaded"));
       }
-      User caller = RpcServer.getRequestUser().orElse(null);
-      if (AUDITLOG.isTraceEnabled()) {
-        // audit log should record all permission changes
-        String remoteAddress = RpcServer.getRemoteAddress().map(InetAddress::toString).orElse("");
-        AUDITLOG.trace("User {} (remote address: {}) revoked permission {}", caller, remoteAddress,
-                userPermission);
-      }
-      return RevokeResponse.getDefaultInstance();
     } catch (IOException ioe) {
       throw new ServiceException(ioe);
     }
@@ -2651,48 +2743,51 @@ public class MasterRpcServices extends RSRpcServices
   public GetUserPermissionsResponse getUserPermissions(RpcController controller,
       GetUserPermissionsRequest request) throws ServiceException {
     try {
-      final String userName = request.hasUserName() ? request.getUserName().toStringUtf8() : null;
-      String namespace =
-          request.hasNamespaceName() ? request.getNamespaceName().toStringUtf8() : null;
-      TableName table =
-          request.hasTableName() ? ProtobufUtil.toTableName(request.getTableName()) : null;
-      byte[] cf = request.hasColumnFamily() ? request.getColumnFamily().toByteArray() : null;
-      byte[] cq = request.hasColumnQualifier() ? request.getColumnQualifier().toByteArray() : null;
-      Type permissionType = request.hasType() ? request.getType() : null;
-      if (master.cpHost != null) {
+      master.checkInitialized();
+      if (master.cpHost != null && hasAccessControlServiceCoprocessor(master.cpHost)) {
+        final String userName = request.hasUserName() ? request.getUserName().toStringUtf8() : null;
+        String namespace =
+            request.hasNamespaceName() ? request.getNamespaceName().toStringUtf8() : null;
+        TableName table =
+            request.hasTableName() ? ProtobufUtil.toTableName(request.getTableName()) : null;
+        byte[] cf = request.hasColumnFamily() ? request.getColumnFamily().toByteArray() : null;
+        byte[] cq =
+            request.hasColumnQualifier() ? request.getColumnQualifier().toByteArray() : null;
+        Type permissionType = request.hasType() ? request.getType() : null;
         master.getMasterCoprocessorHost().preGetUserPermissions(userName, namespace, table, cf, cq);
-      }
 
-      List<UserPermission> perms = null;
-      if (permissionType == Type.Table) {
-        boolean filter = (cf != null || userName != null) ? true : false;
-        perms = PermissionStorage.getUserTablePermissions(master.getConfiguration(), table, cf, cq,
-          userName, filter);
-      } else if (permissionType == Type.Namespace) {
-        perms = PermissionStorage.getUserNamespacePermissions(master.getConfiguration(), namespace,
-          userName, userName != null ? true : false);
-      } else {
-        perms = PermissionStorage.getUserPermissions(master.getConfiguration(), null, null, null,
-          userName, userName != null ? true : false);
-        // Skip super users when filter user is specified
-        if (userName == null) {
-          // Adding superusers explicitly to the result set as PermissionStorage do not store
-          // them. Also using acl as table name to be inline with the results of global admin and
-          // will help in avoiding any leakage of information about being superusers.
-          for (String user : Superusers.getSuperUsers()) {
-            perms.add(new UserPermission(user,
-                Permission.newBuilder().withActions(Action.values()).build()));
+        List<UserPermission> perms = null;
+        if (permissionType == Type.Table) {
+          boolean filter = (cf != null || userName != null) ? true : false;
+          perms = PermissionStorage.getUserTablePermissions(master.getConfiguration(), table, cf,
+            cq, userName, filter);
+        } else if (permissionType == Type.Namespace) {
+          perms = PermissionStorage.getUserNamespacePermissions(master.getConfiguration(),
+            namespace, userName, userName != null ? true : false);
+        } else {
+          perms = PermissionStorage.getUserPermissions(master.getConfiguration(), null, null, null,
+            userName, userName != null ? true : false);
+          // Skip super users when filter user is specified
+          if (userName == null) {
+            // Adding superusers explicitly to the result set as PermissionStorage do not store
+            // them. Also using acl as table name to be inline with the results of global admin and
+            // will help in avoiding any leakage of information about being superusers.
+            for (String user : Superusers.getSuperUsers()) {
+              perms.add(new UserPermission(user,
+                  Permission.newBuilder().withActions(Action.values()).build()));
+            }
           }
         }
-      }
 
-      if (master.cpHost != null) {
         master.getMasterCoprocessorHost().postGetUserPermissions(userName, namespace, table, cf,
           cq);
+        AccessControlProtos.GetUserPermissionsResponse response =
+            ShadedAccessControlUtil.buildGetUserPermissionsResponse(perms);
+        return response;
+      } else {
+        throw new DoNotRetryIOException(
+            new UnsupportedOperationException(AccessController.class.getName() + " is not loaded"));
       }
-      AccessControlProtos.GetUserPermissionsResponse response =
-          ShadedAccessControlUtil.buildGetUserPermissionsResponse(perms);
-      return response;
     } catch (IOException ioe) {
       throw new ServiceException(ioe);
     }
@@ -2702,38 +2797,40 @@ public class MasterRpcServices extends RSRpcServices
   public HasUserPermissionsResponse hasUserPermissions(RpcController controller,
       HasUserPermissionsRequest request) throws ServiceException {
     try {
-      User caller = RpcServer.getRequestUser().orElse(null);
-      String userName =
-          request.hasUserName() ? request.getUserName().toStringUtf8() : caller.getShortName();
-      List<Permission> permissions = new ArrayList<>();
-      for (int i = 0; i < request.getPermissionCount(); i++) {
-        permissions.add(ShadedAccessControlUtil.toPermission(request.getPermission(i)));
-      }
-      if (master.cpHost != null) {
+      master.checkInitialized();
+      if (master.cpHost != null && hasAccessControlServiceCoprocessor(master.cpHost)) {
+        User caller = RpcServer.getRequestUser().orElse(null);
+        String userName =
+            request.hasUserName() ? request.getUserName().toStringUtf8() : caller.getShortName();
+        List<Permission> permissions = new ArrayList<>();
+        for (int i = 0; i < request.getPermissionCount(); i++) {
+          permissions.add(ShadedAccessControlUtil.toPermission(request.getPermission(i)));
+        }
         master.getMasterCoprocessorHost().preHasUserPermissions(userName, permissions);
-      }
-      if (!caller.getShortName().equals(userName)) {
-        List<String> groups = AccessChecker.getUserGroups(userName);
-        caller = new InputUser(userName, groups.toArray(new String[groups.size()]));
-      }
-      List<Boolean> hasUserPermissions = new ArrayList<>();
-      if (getAccessChecker() != null) {
-        for (Permission permission : permissions) {
-          boolean hasUserPermission =
-              getAccessChecker().hasUserPermission(caller, "hasUserPermissions", permission);
-          hasUserPermissions.add(hasUserPermission);
+        if (!caller.getShortName().equals(userName)) {
+          List<String> groups = AccessChecker.getUserGroups(userName);
+          caller = new InputUser(userName, groups.toArray(new String[groups.size()]));
         }
-      } else {
-        for (int i = 0; i < permissions.size(); i++) {
-          hasUserPermissions.add(true);
+        List<Boolean> hasUserPermissions = new ArrayList<>();
+        if (getAccessChecker() != null) {
+          for (Permission permission : permissions) {
+            boolean hasUserPermission =
+                getAccessChecker().hasUserPermission(caller, "hasUserPermissions", permission);
+            hasUserPermissions.add(hasUserPermission);
+          }
+        } else {
+          for (int i = 0; i < permissions.size(); i++) {
+            hasUserPermissions.add(true);
+          }
         }
-      }
-      if (master.cpHost != null) {
         master.getMasterCoprocessorHost().postHasUserPermissions(userName, permissions);
+        HasUserPermissionsResponse.Builder builder =
+            HasUserPermissionsResponse.newBuilder().addAllHasUserPermission(hasUserPermissions);
+        return builder.build();
+      } else {
+        throw new DoNotRetryIOException(
+            new UnsupportedOperationException(AccessController.class.getName() + " is not loaded"));
       }
-      HasUserPermissionsResponse.Builder builder =
-          HasUserPermissionsResponse.newBuilder().addAllHasUserPermission(hasUserPermissions);
-      return builder.build();
     } catch (IOException ioe) {
       throw new ServiceException(ioe);
     }
@@ -2744,7 +2841,14 @@ public class MasterRpcServices extends RSRpcServices
         AbstractFSWALProvider.getWALDirectoryName(serverName.toString()));
     Path splitDir = logDir.suffix(AbstractFSWALProvider.SPLITTING_EXT);
     Path checkDir = master.getFileSystem().exists(splitDir) ? splitDir : logDir;
-    return master.getFileSystem().listStatus(checkDir, META_FILTER).length > 0;
+    try {
+      return master.getFileSystem().listStatus(checkDir, META_FILTER).length > 0;
+    } catch (FileNotFoundException fnfe) {
+      // If no files, then we don't contain metas; was failing schedule of
+      // SCP because this was FNFE'ing when no server dirs ('Unknown Server').
+      LOG.warn("No dir for WALs for {}; continuing", serverName.toString());
+      return false;
+    }
   }
 
   private boolean shouldSubmitSCP(ServerName serverName) {
@@ -2762,5 +2866,36 @@ public class MasterRpcServices extends RSRpcServices
       }
     }
     return true;
+  }
+
+  @Override
+  public GetClusterIdResponse getClusterId(RpcController rpcController, GetClusterIdRequest request)
+      throws ServiceException {
+    GetClusterIdResponse.Builder resp = GetClusterIdResponse.newBuilder();
+    String clusterId = master.getClusterId();
+    if (clusterId != null) {
+      resp.setClusterId(clusterId);
+    }
+    return resp.build();
+  }
+
+  @Override
+  public GetActiveMasterResponse getActiveMaster(RpcController rpcController,
+      GetActiveMasterRequest request) throws ServiceException {
+    GetActiveMasterResponse.Builder resp = GetActiveMasterResponse.newBuilder();
+    Optional<ServerName> serverName = master.getActiveMaster();
+    serverName.ifPresent(name -> resp.setServerName(ProtobufUtil.toServerName(name)));
+    return resp.build();
+  }
+
+  @Override
+  public GetMetaRegionLocationsResponse getMetaRegionLocations(RpcController rpcController,
+      GetMetaRegionLocationsRequest request) throws ServiceException {
+    GetMetaRegionLocationsResponse.Builder response = GetMetaRegionLocationsResponse.newBuilder();
+    Optional<List<HRegionLocation>> metaLocations =
+        master.getMetaRegionLocationCache().getMetaRegionLocations();
+    metaLocations.ifPresent(hRegionLocations -> hRegionLocations.forEach(
+      location -> response.addMetaLocations(ProtobufUtil.toRegionLocation(location))));
+    return response.build();
   }
 }

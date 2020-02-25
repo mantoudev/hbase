@@ -318,6 +318,22 @@ enum MasterSwitchType {
   MERGE = 1;
 }
 
+message SetSnapshotCleanupRequest {
+  required bool enabled = 1;
+  optional bool synchronous = 2;
+}
+
+message SetSnapshotCleanupResponse {
+  required bool prev_snapshot_cleanup = 1;
+}
+
+message IsSnapshotCleanupEnabledRequest {
+}
+
+message IsSnapshotCleanupEnabledResponse {
+  required bool enabled = 1;
+}
+
 message SetSplitOrMergeEnabledRequest {
   required bool enabled = 1;
   optional bool synchronous = 2;
@@ -499,6 +515,10 @@ message GetTableStateRequest {
 
 message GetTableStateResponse {
   required TableState table_state = 1;
+}
+
+message GetRegionStateInMetaResponse {
+  repeated RegionState states = 1;
 }
 
 
@@ -897,6 +917,18 @@ service MasterService {
   rpc RestoreSnapshot(RestoreSnapshotRequest) returns(RestoreSnapshotResponse);
 
   /**
+   * Turn on/off snapshot auto-cleanup based on TTL expiration
+   */
+  rpc SwitchSnapshotCleanup (SetSnapshotCleanupRequest)
+    returns (SetSnapshotCleanupResponse);
+
+  /**
+   * Determine if snapshot auto-cleanup based on TTL expiration is turned on
+   */
+  rpc IsSnapshotCleanupEnabled (IsSnapshotCleanupEnabledRequest)
+    returns (IsSnapshotCleanupEnabledResponse);
+
+  /**
    * Execute a distributed procedure.
    */
   rpc ExecProcedure(ExecProcedureRequest) returns(ExecProcedureResponse);
@@ -1062,6 +1094,10 @@ message SetTableStateInMetaRequest {
   required TableState table_state = 2;
 }
 
+message SetRegionStateInMetaRequest {
+  repeated RegionState states = 2;
+}
+
 /** Like Admin's AssignRegionRequest except it can
  * take one or more Regions at a time.
  */
@@ -1124,6 +1160,10 @@ service HbckService {
   rpc SetTableStateInMeta(SetTableStateInMetaRequest)
     returns(GetTableStateResponse);
 
+  /** Update state of the region in meta only*/
+  rpc SetRegionStateInMeta(SetRegionStateInMetaRequest)
+    returns(GetRegionStateInMetaResponse);
+
   /**
    * Assign regions.
    * Like Admin's assign but works even if the
@@ -1159,4 +1199,48 @@ service HbckService {
   /** Schedule a fix meta run. */
   rpc FixMeta(FixMetaRequest)
     returns(FixMetaResponse);
+}
+
+/** Request and response to get the clusterID for this cluster */
+message GetClusterIdRequest {
+}
+message GetClusterIdResponse {
+  /** Not set if cluster ID could not be determined. */
+  optional string cluster_id = 1;
+}
+
+/** Request and response to get the currently active master name for this cluster */
+message GetActiveMasterRequest {
+}
+message GetActiveMasterResponse {
+  /** Not set if an active master could not be determined. */
+  optional ServerName server_name = 1;
+}
+
+/** Request and response to get the current list of meta region locations */
+message GetMetaRegionLocationsRequest {
+}
+message GetMetaRegionLocationsResponse {
+  /** Not set if meta region locations could not be determined. */
+  repeated RegionLocation meta_locations = 1;
+}
+
+/**
+ * Implements all the RPCs needed by clients to look up cluster meta information needed for connection establishment.
+ */
+service ClientMetaService {
+  /**
+   * Get Cluster ID for this cluster.
+   */
+  rpc GetClusterId(GetClusterIdRequest) returns(GetClusterIdResponse);
+
+  /**
+   * Get active master server name for this cluster.
+   */
+  rpc GetActiveMaster(GetActiveMasterRequest) returns(GetActiveMasterResponse);
+
+  /**
+   * Get current meta replicas' region locations.
+   */
+  rpc GetMetaRegionLocations(GetMetaRegionLocationsRequest) returns(GetMetaRegionLocationsResponse);
 }

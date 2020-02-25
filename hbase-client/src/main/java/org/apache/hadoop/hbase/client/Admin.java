@@ -125,6 +125,14 @@ public interface Admin extends Abortable, Closeable {
   List<TableDescriptor> listTableDescriptors() throws IOException;
 
   /**
+   * List all userspace tables and whether or not include system tables.
+   *
+   * @return a list of TableDescriptors
+   * @throws IOException if a remote or network exception occurs
+   */
+  List<TableDescriptor> listTableDescriptors(boolean includeSysTables) throws IOException;
+
+  /**
    * List all the userspace tables that match the given pattern.
    *
    * @param pattern The compiled regular expression to match against
@@ -898,7 +906,10 @@ public interface Admin extends Abortable, Closeable {
    * @param forcible <code>true</code> if do a compulsory merge, otherwise we will only merge two
    *          adjacent regions
    * @throws IOException if a remote or network exception occurs
+   * @deprecated since 2.3.0 and will be removed in 4.0.0. Multi-region merge feature is now
+   *             supported. Use {@link #mergeRegionsAsync(byte[][], boolean)} instead.
    */
+  @Deprecated
   default Future<Void> mergeRegionsAsync(byte[] nameOfRegionA, byte[] nameOfRegionB,
       boolean forcible) throws IOException {
     byte[][] nameofRegionsToMerge = new byte[2][];
@@ -908,11 +919,7 @@ public interface Admin extends Abortable, Closeable {
   }
 
   /**
-   * Merge regions. Asynchronous operation.
-   * <p/>
-   * You may get a {@code DoNotRetryIOException} if you pass more than two regions in but the master
-   * does not support merging more than two regions. At least till 2.2.0, we still only support
-   * merging two regions.
+   * Merge multiple regions (>=2). Asynchronous operation.
    * @param nameofRegionsToMerge encoded or full name of daughter regions
    * @param forcible <code>true</code> if do a compulsory merge, otherwise we will only merge
    *          adjacent regions
@@ -1054,7 +1061,7 @@ public interface Admin extends Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   default Collection<ServerName> getRegionServers() throws IOException {
-    return getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics().keySet();
+    return getClusterMetrics(EnumSet.of(Option.SERVERS_NAME)).getServersName();
   }
 
   /**
@@ -2232,4 +2239,26 @@ public interface Admin extends Abortable, Closeable {
   default List<Boolean> hasUserPermissions(List<Permission> permissions) throws IOException {
     return hasUserPermissions(null, permissions);
   }
+
+  /**
+   * Turn on or off the auto snapshot cleanup based on TTL.
+   *
+   * @param on Set to <code>true</code> to enable, <code>false</code> to disable.
+   * @param synchronous If <code>true</code>, it waits until current snapshot cleanup is completed,
+   *   if outstanding.
+   * @return Previous auto snapshot cleanup value
+   * @throws IOException if a remote or network exception occurs
+   */
+  boolean snapshotCleanupSwitch(final boolean on, final boolean synchronous)
+      throws IOException;
+
+  /**
+   * Query the current state of the auto snapshot cleanup based on TTL.
+   *
+   * @return <code>true</code> if the auto snapshot cleanup is enabled,
+   *   <code>false</code> otherwise.
+   * @throws IOException if a remote or network exception occurs
+   */
+  boolean isSnapshotCleanupEnabled() throws IOException;
+
 }

@@ -21,17 +21,22 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
-
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -44,15 +49,19 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.Stoppable;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Admin;
+import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.master.HMaster;
+import org.apache.hadoop.hbase.master.cleaner.DirScanPool;
 import org.apache.hadoop.hbase.master.cleaner.HFileCleaner;
 import org.apache.hadoop.hbase.regionserver.ConstantSizeRegionSplitPolicy;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
-import org.apache.hadoop.hbase.testclassification.MediumTests;
+import org.apache.hadoop.hbase.regionserver.HStoreFile;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.testclassification.MiscTests;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HFileArchiveTestingUtil;
 import org.apache.hadoop.hbase.util.HFileArchiveUtil;
@@ -67,6 +76,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.rules.TestName;
+import org.mockito.ArgumentCaptor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -74,7 +84,7 @@ import org.slf4j.LoggerFactory;
  * Test that the {@link HFileArchiver} correctly removes all the parts of a region when cleaning up
  * a region
  */
-@Category({MediumTests.class, MiscTests.class})
+@Category({LargeTests.class, MiscTests.class})
 public class TestHFileArchiving {
 
   @ClassRule
@@ -85,6 +95,7 @@ public class TestHFileArchiving {
   private static final HBaseTestingUtility UTIL = new HBaseTestingUtility();
   private static final byte[] TEST_FAM = Bytes.toBytes("fam");
 
+  private static DirScanPool POOL;
   @Rule
   public TestName name = new TestName();
 
@@ -98,6 +109,8 @@ public class TestHFileArchiving {
 
     // We don't want the cleaner to remove files. The tests do that.
     UTIL.getMiniHBaseCluster().getMaster().getHFileCleaner().cancel(true);
+
+    POOL = new DirScanPool(UTIL.getConfiguration());
   }
 
   private static void setupConf(Configuration conf) {
@@ -116,20 +129,114 @@ public class TestHFileArchiving {
   @After
   public void tearDown() throws Exception {
     // cleanup the archive directory
-    try {
-      clearArchiveDirectory();
-    } catch (IOException e) {
-      Assert.fail("Failure to delete archive directory:" + e.getMessage());
-    }
+    clearArchiveDirectory();
   }
 
   @AfterClass
   public static void cleanupTest() throws Exception {
-    try {
-      UTIL.shutdownMiniCluster();
-    } catch (Exception e) {
-      // NOOP;
+    UTIL.shutdownMiniCluster();
+    POOL.shutdownNow();
+  }
+
+  @Test
+  public void testArchiveStoreFilesDifferentFileSystemsWallWithSchemaPlainRoot() throws Exception {
+    String walDir = "mockFS://mockFSAuthority:9876/mockDir/wals/";
+    String baseDir = FSUtils.getRootDir(UTIL.getConfiguration()).toString() + "/";
+    testArchiveStoreFilesDifferentFileSystems(walDir, baseDir,
+      HFileArchiver::archiveStoreFiles);
+  }
+
+  @Test
+  public void testArchiveStoreFilesDifferentFileSystemsWallNullPlainRoot() throws Exception {
+    String baseDir = FSUtils.getRootDir(UTIL.getConfiguration()).toString() + "/";
+    testArchiveStoreFilesDifferentFileSystems(null, baseDir,
+      HFileArchiver::archiveStoreFiles);
+  }
+
+  @Test
+  public void testArchiveStoreFilesDifferentFileSystemsWallAndRootSame() throws Exception {
+    String baseDir = FSUtils.getRootDir(UTIL.getConfiguration()).toString() + "/";
+    testArchiveStoreFilesDifferentFileSystems("/hbase/wals/", baseDir,
+      HFileArchiver::archiveStoreFiles);
+  }
+
+  private void testArchiveStoreFilesDifferentFileSystems(String walDir, String expectedBase,
+    ArchivingFunction<Configuration, FileSystem, RegionInfo, Path, byte[],
+      Collection<HStoreFile>> archivingFunction) throws IOException {
+    FileSystem mockedFileSystem = mock(FileSystem.class);
+    Configuration conf = new Configuration(UTIL.getConfiguration());
+    if(walDir != null) {
+      conf.set(CommonFSUtils.HBASE_WAL_DIR, walDir);
     }
+    Path filePath = new Path("/mockDir/wals/mockFile");
+    when(mockedFileSystem.getScheme()).thenReturn("mockFS");
+    when(mockedFileSystem.mkdirs(any())).thenReturn(true);
+    when(mockedFileSystem.exists(any())).thenReturn(true);
+    RegionInfo mockedRegion = mock(RegionInfo.class);
+    TableName tableName = TableName.valueOf("mockTable");
+    when(mockedRegion.getTable()).thenReturn(tableName);
+    when(mockedRegion.getEncodedName()).thenReturn("mocked-region-encoded-name");
+    Path tableDir = new Path("mockFS://mockDir/tabledir");
+    byte[] family = Bytes.toBytes("testfamily");
+    HStoreFile mockedFile = mock(HStoreFile.class);
+    List<HStoreFile> list = new ArrayList<>();
+    list.add(mockedFile);
+    when(mockedFile.getPath()).thenReturn(filePath);
+    when(mockedFileSystem.rename(any(),any())).thenReturn(true);
+    archivingFunction.apply(conf, mockedFileSystem, mockedRegion, tableDir, family, list);
+    ArgumentCaptor<Path> pathCaptor = ArgumentCaptor.forClass(Path.class);
+    verify(mockedFileSystem, times(2)).rename(pathCaptor.capture(), any());
+    String expectedDir = expectedBase +
+      "archive/data/default/mockTable/mocked-region-encoded-name/testfamily/mockFile";
+    assertTrue(pathCaptor.getAllValues().get(0).toString().equals(expectedDir));
+  }
+
+  @FunctionalInterface
+  private interface ArchivingFunction<Configuration, FS, Region, Dir, Family, Files> {
+    void apply(Configuration config, FS fs, Region region, Dir dir, Family family, Files files)
+      throws IOException;
+  }
+
+  @Test
+  public void testArchiveRecoveredEditsWalDirNull() throws Exception {
+    testArchiveRecoveredEditsWalDirNullOrSame(null);
+  }
+
+  @Test
+  public void testArchiveRecoveredEditsWalDirSameFsStoreFiles() throws Exception {
+    testArchiveRecoveredEditsWalDirNullOrSame("/wal-dir");
+  }
+
+  private void testArchiveRecoveredEditsWalDirNullOrSame(String walDir) throws Exception {
+    String originalRootDir = UTIL.getConfiguration().get(HConstants.HBASE_DIR);
+    try {
+      String baseDir = "mockFS://mockFSAuthority:9876/hbase/";
+      UTIL.getConfiguration().set(HConstants.HBASE_DIR, baseDir);
+      testArchiveStoreFilesDifferentFileSystems(walDir, baseDir,
+        (conf, fs, region, dir, family, list) -> HFileArchiver
+          .archiveRecoveredEdits(conf, fs, region, family, list));
+    } finally {
+      UTIL.getConfiguration().set(HConstants.HBASE_DIR, originalRootDir);
+    }
+  }
+
+  @Test(expected = IOException.class)
+  public void testArchiveRecoveredEditsWrongFS() throws Exception {
+    String baseDir = FSUtils.getRootDir(UTIL.getConfiguration()).toString() + "/";
+    //Internally, testArchiveStoreFilesDifferentFileSystems will pass a "mockedFS"
+    // to HFileArchiver.archiveRecoveredEdits, but since wal-dir is supposedly on same FS
+    // as root dir it would lead to conflicting FSes and an IOException is expected.
+    testArchiveStoreFilesDifferentFileSystems("/wal-dir", baseDir,
+      (conf, fs, region, dir, family, list) -> HFileArchiver
+        .archiveRecoveredEdits(conf, fs, region, family, list));
+  }
+
+  @Test
+  public void testArchiveRecoveredEditsWalDirDifferentFS() throws Exception {
+    String walDir = "mockFS://mockFSAuthority:9876/mockDir/wals/";
+    testArchiveStoreFilesDifferentFileSystems(walDir, walDir,
+      (conf, fs, region, dir, family, list) ->
+        HFileArchiver.archiveRecoveredEdits(conf, fs, region, family, list));
   }
 
   @Test
@@ -571,12 +678,11 @@ public class TestHFileArchiving {
   }
 
   // Avoid passing a null master to CleanerChore, see HBASE-21175
-  private HFileCleaner getHFileCleaner(Stoppable stoppable, Configuration conf,
-        FileSystem fs, Path archiveDir) throws IOException {
+  private HFileCleaner getHFileCleaner(Stoppable stoppable, Configuration conf, FileSystem fs,
+    Path archiveDir) throws IOException {
     Map<String, Object> params = new HashMap<>();
     params.put(HMaster.MASTER, UTIL.getMiniHBaseCluster().getMaster());
-    HFileCleaner cleaner = new HFileCleaner(1, stoppable, conf, fs, archiveDir);
-    cleaner.init(params);
+    HFileCleaner cleaner = new HFileCleaner(1, stoppable, conf, fs, archiveDir, POOL);
     return Objects.requireNonNull(cleaner);
   }
 

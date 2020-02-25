@@ -53,6 +53,7 @@ import org.apache.hadoop.hbase.regionserver.HStore;
 import org.apache.hadoop.hbase.testclassification.ClientTests;
 import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.FutureUtils;
 import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;
 import org.junit.Assert;
 import org.junit.ClassRule;
@@ -348,11 +349,13 @@ public class TestAdmin2 extends TestAdminBase {
   private Admin createTable(TableName tableName) throws IOException {
     Admin admin = TEST_UTIL.getAdmin();
 
-    HTableDescriptor htd = new HTableDescriptor(tableName);
-    HColumnDescriptor hcd = new HColumnDescriptor("value");
+    TableDescriptorBuilder tableDescriptorBuilder =
+      TableDescriptorBuilder.newBuilder(tableName);
+    ColumnFamilyDescriptor columnFamilyDescriptor =
+      ColumnFamilyDescriptorBuilder.newBuilder(Bytes.toBytes("value")).build();
 
-    htd.addFamily(hcd);
-    admin.createTable(htd);
+    tableDescriptorBuilder.setColumnFamily(columnFamilyDescriptor);
+    admin.createTable(tableDescriptorBuilder.build());
     return admin;
   }
 
@@ -361,11 +364,13 @@ public class TestAdmin2 extends TestAdminBase {
   }
 
   private void createTableWithDefaultConf(TableName TABLENAME) throws IOException {
-    HTableDescriptor htd = new HTableDescriptor(TABLENAME);
-    HColumnDescriptor hcd = new HColumnDescriptor("value");
-    htd.addFamily(hcd);
+    TableDescriptorBuilder tableDescriptorBuilder =
+      TableDescriptorBuilder.newBuilder(TABLENAME);
+    ColumnFamilyDescriptor columnFamilyDescriptor =
+      ColumnFamilyDescriptorBuilder.newBuilder(Bytes.toBytes("value")).build();
+    tableDescriptorBuilder.setColumnFamily(columnFamilyDescriptor);
 
-    ADMIN.createTable(htd);
+    ADMIN.createTable(tableDescriptorBuilder.build());
   }
 
   /**
@@ -694,6 +699,32 @@ public class TestAdmin2 extends TestAdminBase {
       // Make sure that the store size is still the actual file system's store size.
       Assert.assertEquals(expectedStoreFilesSize, store.getSize());
     }
+
+    // Test querying using the encoded name only. When encoded name passed,
+    // and the target server is the Master, we return the full region name.
+    // Convenience.
+    ServerName sn = null;
+    try (Admin admin = TEST_UTIL.getConnection().getAdmin()) {
+      sn = admin.getMaster();
+    }
+    RegionInfo ri = region.getRegionInfo();
+    testGetWithRegionName(sn, ri, ri.getEncodedNameAsBytes());
+    testGetWithRegionName(sn, ri, ri.getRegionName());
+    // Try querying meta encoded name.
+    ri = RegionInfoBuilder.FIRST_META_REGIONINFO;
+    testGetWithRegionName(sn, ri, ri.getEncodedNameAsBytes());
+    testGetWithRegionName(sn, ri, ri.getRegionName());
+  }
+
+  /**
+   * Do get of RegionInfo from Master using encoded region name.
+   */
+  private void testGetWithRegionName(ServerName sn, RegionInfo inputRI,
+      byte [] regionName) throws IOException {
+    RegionInfo ri = ProtobufUtil.toRegionInfo(FutureUtils.get(
+      TEST_UTIL.getAsyncConnection().getRegionServerAdmin(sn).getRegionInfo(
+        ProtobufUtil.getGetRegionInfoRequest(regionName))).getRegionInfo());
+    assertEquals(inputRI, ri);
   }
 
   @Test
@@ -755,4 +786,31 @@ public class TestAdmin2 extends TestAdminBase {
     ADMIN.modifyTable(tableDesc);
     assertEquals(11111111, ADMIN.getDescriptor(tableName).getMaxFileSize());
   }
+
+  @Test
+  public void testSnapshotCleanupAsync() throws Exception {
+    testSnapshotCleanup(false);
+  }
+
+  @Test
+  public void testSnapshotCleanupSync() throws Exception {
+    testSnapshotCleanup(true);
+  }
+
+  private void testSnapshotCleanup(final boolean synchronous) throws IOException {
+    final boolean initialState = ADMIN.isSnapshotCleanupEnabled();
+    // Switch the snapshot auto cleanup state to opposite to initial state
+    boolean prevState = ADMIN.snapshotCleanupSwitch(!initialState, synchronous);
+    // The previous state should be the original state we observed
+    assertEquals(initialState, prevState);
+    // Current state should be opposite of the initial state
+    assertEquals(!initialState, ADMIN.isSnapshotCleanupEnabled());
+    // Reset the state back to what it was initially
+    prevState = ADMIN.snapshotCleanupSwitch(initialState, synchronous);
+    // The previous state should be the opposite of the initial state
+    assertEquals(!initialState, prevState);
+    // Current state should be the original state again
+    assertEquals(initialState, ADMIN.isSnapshotCleanupEnabled());
+  }
+
 }

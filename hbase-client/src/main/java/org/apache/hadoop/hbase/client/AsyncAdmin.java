@@ -513,18 +513,17 @@ public interface AsyncAdmin {
    * @param nameOfRegionB encoded or full name of region b
    * @param forcible true if do a compulsory merge, otherwise we will only merge two adjacent
    *          regions
+   * @deprecated since 2.3.0 and will be removed in 4.0.0.Use {@link #mergeRegions(List, boolean)}
+   *             instead.
    */
+  @Deprecated
   default CompletableFuture<Void> mergeRegions(byte[] nameOfRegionA, byte[] nameOfRegionB,
       boolean forcible) {
     return mergeRegions(Arrays.asList(nameOfRegionA, nameOfRegionB), forcible);
   }
 
   /**
-   * Merge regions.
-   * <p/>
-   * You may get a {@code DoNotRetryIOException} if you pass more than two regions in but the master
-   * does not support merging more than two regions. At least till 2.2.0, we still only support
-   * merging two regions.
+   * Merge multiple regions (>=2).
    * @param nameOfRegionsToMerge encoded or full name of daughter regions
    * @param forcible true if do a compulsory merge, otherwise we will only merge two adjacent
    *          regions
@@ -1048,8 +1047,8 @@ public interface AsyncAdmin {
    * @return current live region servers list wrapped by {@link CompletableFuture}
    */
   default CompletableFuture<Collection<ServerName>> getRegionServers() {
-    return getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS))
-      .thenApply(cm -> cm.getLiveServerMetrics().keySet());
+    return getClusterMetrics(EnumSet.of(Option.SERVERS_NAME))
+        .thenApply(ClusterMetrics::getServersName);
   }
 
   /**
@@ -1484,4 +1483,27 @@ public interface AsyncAdmin {
   default CompletableFuture<List<Boolean>> hasUserPermissions(List<Permission> permissions) {
     return hasUserPermissions(null, permissions);
   }
+
+  /**
+   * Turn on or off the auto snapshot cleanup based on TTL.
+   * <p/>
+   * Notice that, the method itself is always non-blocking, which means it will always return
+   * immediately. The {@code sync} parameter only effects when will we complete the returned
+   * {@link CompletableFuture}.
+   *
+   * @param on Set to <code>true</code> to enable, <code>false</code> to disable.
+   * @param sync If <code>true</code>, it waits until current snapshot cleanup is completed,
+   *   if outstanding.
+   * @return Previous auto snapshot cleanup value wrapped by a {@link CompletableFuture}.
+   */
+  CompletableFuture<Boolean> snapshotCleanupSwitch(boolean on, boolean sync);
+
+  /**
+   * Query the current state of the auto snapshot cleanup based on TTL.
+   *
+   * @return true if the auto snapshot cleanup is enabled, false otherwise.
+   *   The return value will be wrapped by a {@link CompletableFuture}.
+   */
+  CompletableFuture<Boolean> isSnapshotCleanupEnabled();
+
 }

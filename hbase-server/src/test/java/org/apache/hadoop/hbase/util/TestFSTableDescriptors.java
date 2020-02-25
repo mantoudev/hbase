@@ -169,7 +169,7 @@ public class TestFSTableDescriptors {
     Path rootdir = new Path(UTIL.getDataTestDir(), name);
     TableDescriptors htds = new FSTableDescriptors(UTIL.getConfiguration(), fs, rootdir);
     TableDescriptor htd = TableDescriptorBuilder.newBuilder(TableName.valueOf(name)).build();
-    htds.add(htd);
+    htds.update(htd);
     assertNotNull(htds.remove(htd.getTableName()));
     assertNull(htds.remove(htd.getTableName()));
   }
@@ -306,7 +306,38 @@ public class TestFSTableDescriptors {
     assertEquals("getAll() didn't return all TableDescriptors, expected: " +
                    (count + 1) + " got: " + htds.getAll().size(),
                  count + 1, htds.getAll().size());
+  }
 
+  @Test
+  public void testGetAllOrdering() throws Exception {
+    final String name = "testGetAllOrdering";
+    FileSystem fs = FileSystem.get(UTIL.getConfiguration());
+    Path rootDir = new Path(UTIL.getDataTestDir(), name);
+    FSTableDescriptors tds = new FSTableDescriptorsTest(UTIL.getConfiguration(), fs, rootDir);
+
+    String[] tableNames = new String[] { "foo", "bar", "foo:bar", "bar:foo" };
+    for (String tableName : tableNames) {
+      tds.createTableDescriptor(
+          TableDescriptorBuilder.newBuilder(TableName.valueOf(tableName)).build());
+    }
+
+    Map<String, TableDescriptor> tables = tds.getAll();
+    // Remove hbase:meta from list. It shows up now since we  made it dynamic. The schema
+    // is written into the fs by the FSTableDescriptors constructor now where before it
+    // didn't.
+    tables.remove(TableName.META_TABLE_NAME.getNameAsString());
+    assertEquals(4, tables.size());
+
+
+    String[] tableNamesOrdered =
+        new String[] { "bar:foo", "default:bar", "default:foo", "foo:bar" };
+    int i = 0;
+    for (Map.Entry<String, TableDescriptor> entry : tables.entrySet()) {
+      assertEquals(tableNamesOrdered[i], entry.getKey());
+      assertEquals(tableNamesOrdered[i],
+          entry.getValue().getTableName().getNameWithNamespaceInclAsString());
+      i++;
+    }
   }
 
   @Test
@@ -333,12 +364,13 @@ public class TestFSTableDescriptors {
 
     assertTrue(nonchtds.getAll().size() == chtds.getAll().size());
 
-    // add a new entry for hbase:meta
-    TableDescriptor htd = TableDescriptorBuilder.newBuilder(TableName.META_TABLE_NAME).build();
+    // add a new entry for random table name.
+    TableName random = TableName.valueOf("random");
+    TableDescriptor htd = TableDescriptorBuilder.newBuilder(random).build();
     nonchtds.createTableDescriptor(htd);
 
-    // hbase:meta will only increase the cachehit by 1
-    assertTrue(nonchtds.getAll().size() == chtds.getAll().size());
+    // random will only increase the cachehit by 1
+    assertEquals(nonchtds.getAll().size(), chtds.getAll().size() + 1);
 
     for (Map.Entry<String, TableDescriptor> entry: nonchtds.getAll().entrySet()) {
       String t = (String) entry.getKey();
@@ -368,9 +400,9 @@ public class TestFSTableDescriptors {
     Path rootdir = new Path(UTIL.getDataTestDir(), name);
     TableDescriptors htds = new FSTableDescriptors(UTIL.getConfiguration(), fs, rootdir);
     TableDescriptor htd = TableDescriptorBuilder.newBuilder(TableName.valueOf(name)).build();
-    htds.add(htd);
-    htds.add(htd);
-    htds.add(htd);
+    htds.update(htd);
+    htds.update(htd);
+    htds.update(htd);
   }
 
   @Test

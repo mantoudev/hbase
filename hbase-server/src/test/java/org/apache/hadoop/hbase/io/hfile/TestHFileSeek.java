@@ -23,19 +23,17 @@ import java.util.Random;
 import java.util.StringTokenizer;
 import junit.framework.TestCase;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RawLocalFileSystem;
-import org.apache.hadoop.hbase.CellComparatorImpl;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.io.hfile.HFile.Reader;
 import org.apache.hadoop.hbase.io.hfile.HFile.Writer;
 import org.apache.hadoop.hbase.testclassification.IOTests;
-import org.apache.hadoop.hbase.testclassification.MediumTests;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.BytesWritable;
 import org.junit.ClassRule;
@@ -60,7 +58,7 @@ import org.apache.hbase.thirdparty.org.apache.commons.cli.ParseException;
  * Remove after tfile is committed and use the tfile version of this class
  * instead.</p>
  */
-@Category({IOTests.class, MediumTests.class})
+@Category({IOTests.class, SmallTests.class})
 public class TestHFileSeek extends TestCase {
 
   @ClassRule
@@ -143,7 +141,6 @@ public class TestHFileSeek extends TestCase {
       Writer writer = HFile.getWriterFactoryNoCache(conf)
           .withOutputStream(fout)
           .withFileContext(context)
-          .withComparator(CellComparatorImpl.COMPARATOR)
           .create();
       try {
         BytesWritable key = new BytesWritable();
@@ -188,10 +185,8 @@ public class TestHFileSeek extends TestCase {
   public void seekTFile() throws IOException {
     int miss = 0;
     long totalBytes = 0;
-    FSDataInputStream fsdis = fs.open(path);
-    Reader reader = HFile.createReaderFromStream(path, fsdis,
-        fs.getFileStatus(path).getLen(), new CacheConfig(conf), conf);
-    reader.loadFileInfo();
+    ReaderContext context = new ReaderContextBuilder().withFileSystemAndPath(fs, path).build();
+    Reader reader = TestHFile.createReaderFromStream(context, new CacheConfig(conf), conf);
     KeySampler kSampler = new KeySampler(rng, ((KeyValue) reader.getFirstKey().get()).getKey(),
         ((KeyValue) reader.getLastKey().get()).getKey(), keyLenGen);
     HFileScanner scanner = reader.getScanner(false, USE_PREAD);

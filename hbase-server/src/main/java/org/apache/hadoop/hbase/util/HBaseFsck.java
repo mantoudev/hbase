@@ -116,7 +116,6 @@ import org.apache.hadoop.hbase.replication.ReplicationException;
 import org.apache.hadoop.hbase.replication.ReplicationPeerDescription;
 import org.apache.hadoop.hbase.replication.ReplicationQueueStorage;
 import org.apache.hadoop.hbase.replication.ReplicationStorageFactory;
-import org.apache.hadoop.hbase.replication.ReplicationUtils;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.util.Bytes.ByteArrayComparator;
@@ -150,7 +149,9 @@ import org.apache.hbase.thirdparty.com.google.common.collect.Sets;
  * HBaseFsck (hbck) is a tool for checking and repairing region consistency and
  * table integrity problems in a corrupted HBase. This tool was written for hbase-1.x. It does not
  * work with hbase-2.x; it can read state but is not allowed to change state; i.e. effect 'repair'.
- * See hbck2 (HBASE-19121) for a hbck tool for hbase2.
+ * Even though it can 'read' state, given how so much has changed in how hbase1 and hbase2 operate,
+ * it will often misread. See hbck2 (HBASE-19121) for a hbck tool for hbase2. This class is
+ * deprecated.
  *
  * <p>
  * Region consistency checks verify that hbase:meta, region deployment on region
@@ -193,7 +194,9 @@ import org.apache.hbase.thirdparty.com.google.common.collect.Sets;
  * If hbck is run from the command line, there are a handful of arguments that
  * can be used to limit the kinds of repairs hbck will do.  See the code in
  * {@link #printUsageAndExit()} for more details.
+ * @deprecated For removal in hbase-4.0.0. Use HBCK2 instead.
  */
+@Deprecated
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.TOOLS)
 @InterfaceStability.Evolving
 public class HBaseFsck extends Configured implements Closeable {
@@ -1010,7 +1013,6 @@ public class HBaseFsck extends Configured implements Closeable {
         HFile.Reader hf = null;
         try {
           hf = HFile.createReader(fs, hfile.getPath(), CacheConfig.DISABLED, true, getConf());
-          hf.loadFileInfo();
           Optional<Cell> startKv = hf.getFirstKey();
           start = CellUtil.cloneRow(startKv.get());
           Optional<Cell> endKv = hf.getLastKey();
@@ -3913,8 +3915,8 @@ public class HBaseFsck extends Configured implements Closeable {
     List<ReplicationPeerDescription> peerDescriptions = admin.listReplicationPeers();
     if (peerDescriptions != null && peerDescriptions.size() > 0) {
       List<String> peers = peerDescriptions.stream()
-          .filter(peerConfig -> ReplicationUtils.contains(peerConfig.getPeerConfig(),
-            cleanReplicationBarrierTable))
+          .filter(peerConfig -> peerConfig.getPeerConfig()
+            .needToReplicate(cleanReplicationBarrierTable))
           .map(peerConfig -> peerConfig.getPeerId()).collect(Collectors.toList());
       try {
         List<String> batch = new ArrayList<>();

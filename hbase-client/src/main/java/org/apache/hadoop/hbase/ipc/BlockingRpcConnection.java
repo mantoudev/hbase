@@ -35,7 +35,6 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
-import java.nio.ByteBuffer;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayDeque;
 import java.util.Locale;
@@ -55,6 +54,7 @@ import org.apache.hadoop.hbase.log.HBaseMarkers;
 import org.apache.hadoop.hbase.security.HBaseSaslRpcClient;
 import org.apache.hadoop.hbase.security.SaslUtil;
 import org.apache.hadoop.hbase.security.SaslUtil.QualityOfProtection;
+import org.apache.hadoop.hbase.security.provider.SaslClientAuthenticationProvider;
 import org.apache.hadoop.hbase.trace.TraceUtil;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.ExceptionUtil;
@@ -70,6 +70,8 @@ import org.slf4j.LoggerFactory;
 import org.apache.hbase.thirdparty.com.google.protobuf.Message;
 import org.apache.hbase.thirdparty.com.google.protobuf.Message.Builder;
 import org.apache.hbase.thirdparty.com.google.protobuf.RpcCallback;
+import org.apache.hbase.thirdparty.io.netty.buffer.ByteBuf;
+import org.apache.hbase.thirdparty.io.netty.buffer.PooledByteBufAllocator;
 import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.CellBlockMeta;
@@ -148,7 +150,7 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
 
     public void sendCall(final Call call) throws IOException {
       if (callsToWrite.size() >= maxQueueSize) {
-        throw new IOException("Can't add the call " + call.id
+        throw new IOException("Can't add " + call.toShortString()
             + " to the write queue. callsToWrite.size()=" + callsToWrite.size());
       }
       callsToWrite.offer(call);
@@ -160,7 +162,7 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
       // By removing the call from the expected call list, we make the list smaller, but
       // it means as well that we don't know how many calls we cancelled.
       calls.remove(call.id);
-      call.setException(new CallCancelledException("Call id=" + call.id + ", waitTime="
+      call.setException(new CallCancelledException(call.toShortString() + ", waitTime="
           + (EnvironmentEdgeManager.currentTime() - call.getStartTime()) + ", rpcTimeout="
           + call.timeout));
     }
@@ -192,9 +194,7 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
           } catch (IOException e) {
             // exception here means the call has not been added to the pendingCalls yet, so we need
             // to fail it by our own.
-            if (LOG.isDebugEnabled()) {
-              LOG.debug("call write error for call #" + call.id, e);
-            }
+            LOG.debug("call write error for {}", call.toShortString());
             call.setException(e);
             closeConn(e);
           }
@@ -362,9 +362,10 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
 
   private boolean setupSaslConnection(final InputStream in2, final OutputStream out2)
       throws IOException {
-    saslRpcClient = new HBaseSaslRpcClient(authMethod, token, serverPrincipal,
-        this.rpcClient.fallbackAllowed, this.rpcClient.conf.get("hbase.rpc.protection",
-          QualityOfProtection.AUTHENTICATION.name().toLowerCase(Locale.ROOT)),
+    saslRpcClient = new HBaseSaslRpcClient(this.rpcClient.conf, provider, token,
+        serverAddress, securityInfo, this.rpcClient.fallbackAllowed,
+        this.rpcClient.conf.get("hbase.rpc.protection",
+            QualityOfProtection.AUTHENTICATION.name().toLowerCase(Locale.ROOT)),
         this.rpcClient.conf.getBoolean(CRYPTO_AES_ENABLED_KEY, CRYPTO_AES_ENABLED_DEFAULT));
     return saslRpcClient.saslConnect(in2, out2);
   }
@@ -376,11 +377,10 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
    * connection again. The other problem is to do with ticket expiry. To handle that, a relogin is
    * attempted.
    * <p>
-   * The retry logic is governed by the {@link #shouldAuthenticateOverKrb} method. In case when the
-   * user doesn't have valid credentials, we don't need to retry (from cache or ticket). In such
-   * cases, it is prudent to throw a runtime exception when we receive a SaslException from the
-   * underlying authentication implementation, so there is no retry from other high level (for eg,
-   * HCM or HBaseAdmin).
+   * The retry logic is governed by the {@link SaslClientAuthenticationProvider#canRetry()}
+   * method. Some providers have the ability to obtain new credentials and then re-attempt to
+   * authenticate with HBase services. Other providers will continue to fail if they failed the
+   * first time -- for those, we want to fail-fast.
    * </p>
    */
   private void handleSaslConnectionFailure(final int currRetries, final int maxRetries,
@@ -390,40 +390,44 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
     user.doAs(new PrivilegedExceptionAction<Object>() {
       @Override
       public Object run() throws IOException, InterruptedException {
-        if (shouldAuthenticateOverKrb()) {
-          if (currRetries < maxRetries) {
-            if (LOG.isDebugEnabled()) {
-              LOG.debug("Exception encountered while connecting to " +
-                "the server : " + StringUtils.stringifyException(ex));
-            }
-            // try re-login
-            relogin();
-            disposeSasl();
-            // have granularity of milliseconds
-            // we are sleeping with the Connection lock held but since this
-            // connection instance is being used for connecting to the server
-            // in question, it is okay
-            Thread.sleep(ThreadLocalRandom.current().nextInt(reloginMaxBackoff) + 1);
-            return null;
-          } else {
-            String msg = "Couldn't setup connection for "
-                + UserGroupInformation.getLoginUser().getUserName() + " to " + serverPrincipal;
-            LOG.warn(msg, ex);
-            throw (IOException) new IOException(msg).initCause(ex);
+        // A provider which failed authentication, but doesn't have the ability to relogin with
+        // some external system (e.g. username/password, the password either works or it doesn't)
+        if (!provider.canRetry()) {
+          LOG.warn("Exception encountered while connecting to the server : " + ex);
+          if (ex instanceof RemoteException) {
+            throw (RemoteException) ex;
           }
+          if (ex instanceof SaslException) {
+            String msg = "SASL authentication failed."
+                + " The most likely cause is missing or invalid credentials.";
+            throw new RuntimeException(msg, ex);
+          }
+          throw new IOException(ex);
+        }
+
+        // Other providers, like kerberos, could request a new ticket from a keytab. Let
+        // them try again.
+        if (currRetries < maxRetries) {
+          LOG.debug("Exception encountered while connecting to the server", ex);
+
+          // Invoke the provider to perform the relogin
+          provider.relogin();
+
+          // Get rid of any old state on the SaslClient
+          disposeSasl();
+
+          // have granularity of milliseconds
+          // we are sleeping with the Connection lock held but since this
+          // connection instance is being used for connecting to the server
+          // in question, it is okay
+          Thread.sleep(ThreadLocalRandom.current().nextInt(reloginMaxBackoff) + 1);
+          return null;
         } else {
-          LOG.warn("Exception encountered while connecting to " + "the server : " + ex);
+          String msg = "Failed to initiate connection for "
+              + UserGroupInformation.getLoginUser().getUserName() + " to "
+              + securityInfo.getServerPrincipal();
+          throw new IOException(msg, ex);
         }
-        if (ex instanceof RemoteException) {
-          throw (RemoteException) ex;
-        }
-        if (ex instanceof SaslException) {
-          String msg = "SASL authentication failed."
-              + " The most likely cause is missing or invalid credentials." + " Consider 'kinit'.";
-          LOG.error(HBaseMarkers.FATAL, msg, ex);
-          throw new RuntimeException(msg, ex);
-        }
-        throw new IOException(ex);
       }
     });
   }
@@ -460,7 +464,7 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
         if (useSasl) {
           final InputStream in2 = inStream;
           final OutputStream out2 = outStream;
-          UserGroupInformation ticket = getUGI();
+          UserGroupInformation ticket = provider.getRealUser(remoteId.ticket);
           boolean continueSasl;
           if (ticket == null) {
             throw new FatalConnectionException("ticket/user is null");
@@ -579,7 +583,7 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
 
   private void negotiateCryptoAes(RPCProtos.CryptoCipherMeta cryptoCipherMeta)
       throws IOException {
-    // initilize the Crypto AES with CryptoCipherMeta
+    // initialize the Crypto AES with CryptoCipherMeta
     saslRpcClient.initCryptoCipher(cryptoCipherMeta, this.rpcClient.conf);
     // reset the inputStream/outputStream for Crypto AES encryption
     this.in = new DataInputStream(new BufferedInputStream(saslRpcClient.getInputStream()));
@@ -599,37 +603,44 @@ class BlockingRpcConnection extends RpcConnection implements Runnable {
    * @see #readResponse()
    */
   private void writeRequest(Call call) throws IOException {
-    ByteBuffer cellBlock = this.rpcClient.cellBlockBuilder.buildCellBlock(this.codec,
-      this.compressor, call.cells);
-    CellBlockMeta cellBlockMeta;
-    if (cellBlock != null) {
-      cellBlockMeta = CellBlockMeta.newBuilder().setLength(cellBlock.limit()).build();
-    } else {
-      cellBlockMeta = null;
-    }
-    RequestHeader requestHeader = buildRequestHeader(call, cellBlockMeta);
-
-    setupIOstreams();
-
-    // Now we're going to write the call. We take the lock, then check that the connection
-    // is still valid, and, if so we do the write to the socket. If the write fails, we don't
-    // know where we stand, we have to close the connection.
-    if (Thread.interrupted()) {
-      throw new InterruptedIOException();
-    }
-
-    calls.put(call.id, call); // We put first as we don't want the connection to become idle.
-    // from here, we do not throw any exception to upper layer as the call has been tracked in the
-    // pending calls map.
+    ByteBuf cellBlock = null;
     try {
-      call.callStats.setRequestSizeBytes(write(this.out, requestHeader, call.param, cellBlock));
-    } catch (Throwable t) {
-      if(LOG.isTraceEnabled()) {
-        LOG.trace("Error while writing call, call_id:" + call.id, t);
+      cellBlock = this.rpcClient.cellBlockBuilder.buildCellBlock(this.codec, this.compressor,
+          call.cells, PooledByteBufAllocator.DEFAULT);
+      CellBlockMeta cellBlockMeta;
+      if (cellBlock != null) {
+        cellBlockMeta = CellBlockMeta.newBuilder().setLength(cellBlock.readableBytes()).build();
+      } else {
+        cellBlockMeta = null;
       }
-      IOException e = IPCUtil.toIOE(t);
-      closeConn(e);
-      return;
+      RequestHeader requestHeader = buildRequestHeader(call, cellBlockMeta);
+
+      setupIOstreams();
+
+      // Now we're going to write the call. We take the lock, then check that the connection
+      // is still valid, and, if so we do the write to the socket. If the write fails, we don't
+      // know where we stand, we have to close the connection.
+      if (Thread.interrupted()) {
+        throw new InterruptedIOException();
+      }
+
+      calls.put(call.id, call); // We put first as we don't want the connection to become idle.
+      // from here, we do not throw any exception to upper layer as the call has been tracked in
+      // the pending calls map.
+      try {
+        call.callStats.setRequestSizeBytes(write(this.out, requestHeader, call.param, cellBlock));
+      } catch (Throwable t) {
+        if(LOG.isTraceEnabled()) {
+          LOG.trace("Error while writing {}", call.toShortString());
+        }
+        IOException e = IPCUtil.toIOE(t);
+        closeConn(e);
+        return;
+      }
+    } finally {
+      if (cellBlock != null) {
+        cellBlock.release();
+      }
     }
     notifyAll();
   }
